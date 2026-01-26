@@ -324,7 +324,7 @@ struct Connection {
     ibv_port_attr port_attr;
     ibv().query_port(ctx, 1, &port_attr);
     ibv_gid gid;
-    ibv().query_gid(ctx, 1, 1, &gid);
+    ibv().query_gid(ctx, 1, 0, &gid);
 
     src.local_id = port_attr.lid;
     src.queue_pair_number = queue_pair->qp_num;
@@ -369,7 +369,7 @@ struct Connection {
       attr.ah_attr.is_global = 1;
       attr.ah_attr.grh.hop_limit = 1;
       attr.ah_attr.grh.dgid = dst.global_identifier;
-      attr.ah_attr.grh.sgid_index = 1;
+      attr.ah_attr.grh.sgid_index = 0;
     }
 
     int mask = IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |
