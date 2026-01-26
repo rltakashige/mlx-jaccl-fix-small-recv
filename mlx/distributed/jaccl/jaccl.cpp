@@ -245,12 +245,14 @@ struct Connection {
   ibv_cq* completion_queue;
   ibv_qp* queue_pair;
   Destination src; // holds the local information
+  int gid_index; // valid GID index found during info()
 
   Connection(ibv_context* ctx_)
       : ctx(ctx_),
         protection_domain(nullptr),
         completion_queue(nullptr),
-        queue_pair(nullptr) {
+        queue_pair(nullptr),
+        gid_index(-1) {
     src.local_id = -1;
   }
 
@@ -260,6 +262,7 @@ struct Connection {
     std::swap(completion_queue, c.completion_queue);
     std::swap(queue_pair, c.queue_pair);
     std::swap(src, c.src);
+    std::swap(gid_index, c.gid_index);
   }
 
   Connection(const Connection&) = delete;
@@ -323,8 +326,32 @@ struct Connection {
 
     ibv_port_attr port_attr;
     ibv().query_port(ctx, 1, &port_attr);
+
+    // Auto-detect a valid GID index by scanning available indices
     ibv_gid gid;
-    ibv().query_gid(ctx, 1, 0, &gid);
+    gid_index = -1;
+    for (int i = 0; i < 16; ++i) {
+      ibv_gid test_gid;
+      if (ibv().query_gid(ctx, 1, i, &test_gid) == 0) {
+        // Check if GID is non-zero (valid)
+        bool is_valid = false;
+        for (int j = 0; j < 16; ++j) {
+          if (test_gid.raw[j] != 0) {
+            is_valid = true;
+            break;
+          }
+        }
+        if (is_valid) {
+          gid = test_gid;
+          gid_index = i;
+          break;
+        }
+      }
+    }
+
+    if (gid_index < 0) {
+      throw std::runtime_error("[jaccl] No valid GID found on port 1");
+    }
 
     src.local_id = port_attr.lid;
     src.queue_pair_number = queue_pair->qp_num;
@@ -369,7 +396,7 @@ struct Connection {
       attr.ah_attr.is_global = 1;
       attr.ah_attr.grh.hop_limit = 1;
       attr.ah_attr.grh.dgid = dst.global_identifier;
-      attr.ah_attr.grh.sgid_index = 0;
+      attr.ah_attr.grh.sgid_index = gid_index;
     }
 
     int mask = IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |
