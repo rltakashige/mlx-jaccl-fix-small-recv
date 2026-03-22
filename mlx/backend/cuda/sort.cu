@@ -52,7 +52,7 @@ struct InitValue {
 };
 
 template <typename T>
-struct InitValue<T, cuda::std::enable_if_t<std::is_floating_point_v<T>>> {
+struct InitValue<T, cuda::std::enable_if_t<is_floating_v<T>>> {
   __device__ __forceinline__ static T value() {
     return nan_value<T>();
   }
@@ -72,7 +72,7 @@ struct LessThan {
   }
 
   __device__ __forceinline__ bool operator()(T a, T b) const {
-    if constexpr (std::is_floating_point_v<T>) {
+    if constexpr (is_floating_v<T>) {
       bool an = cuda::std::isnan(a);
       bool bn = cuda::std::isnan(b);
       if (an | bn) {
@@ -783,7 +783,6 @@ void single_block_sort(
                   kernel,
                   grid,
                   block,
-                  0,
                   gpu_ptr<ValT>(in),
                   gpu_ptr<OutT>(out),
                   size_sorted_axis,
@@ -805,7 +804,6 @@ void single_block_sort(
                   kernel,
                   grid,
                   block,
-                  0,
                   gpu_ptr<ValT>(in),
                   gpu_ptr<OutT>(out),
                   size_sorted_axis,
@@ -897,7 +895,6 @@ void multi_block_sort(
             block_sort_kernel,
             grid,
             block,
-            0,
             gpu_ptr<ValT>(in),
             gpu_ptr<ValT>(dev_vals_in),
             gpu_ptr<IdxT>(dev_idxs_in),
@@ -926,7 +923,6 @@ void multi_block_sort(
               partition_kernel,
               dim3(1, n_rows, 1),
               dim3(n_thr_per_group, 1, 1),
-              0,
               gpu_ptr<IdxT>(block_partitions),
               gpu_ptr<ValT>(dev_vals_in),
               gpu_ptr<IdxT>(dev_idxs_in),
@@ -951,7 +947,6 @@ void multi_block_sort(
               merge_kernel,
               dim3(n_blocks, n_rows, 1),
               dim3(BLOCK_THREADS, 1, 1),
-              0,
               gpu_ptr<IdxT>(block_partitions),
               gpu_ptr<ValT>(dev_vals_in),
               gpu_ptr<IdxT>(dev_idxs_in),
