@@ -1,7 +1,9 @@
 // Copyright © 2025 Apple Inc.
+// RavenX fix: explicit includes for standalone JIT compilation on macOS Tahoe
 
 #pragma once
 
+#include "mlx/backend/metal/kernels/bf16.h"
 #include "mlx/backend/metal/kernels/indexing/indexing.h"
 
 template <typename T, typename IdxT, typename LocT, int N>
