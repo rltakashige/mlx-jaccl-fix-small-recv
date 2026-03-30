@@ -884,6 +884,34 @@ class TestCompile(mlx_tests.MLXTestCase):
         fun = mx.compile(lambda a, b: a @ b, shapeless=True)
         self.assertTrue(mx.allclose(fun(a, b), a @ b))
 
+    def test_shapeless_compile_addmm(self):
+        def fun(c, a, b):
+            return mx.addmm(c, a, b)
+
+        cfun = mx.compile(fun, shapeless=True)
+
+        # First shape
+        c = mx.ones((2, 4))
+        a = mx.ones((2, 3))
+        b = mx.ones((3, 4))
+        self.assertTrue(mx.allclose(cfun(c, a, b), fun(c, a, b)))
+
+        # Different shape, same ranks — should not recompile
+        c = mx.ones((3, 5))
+        a = mx.ones((3, 6))
+        b = mx.ones((6, 5))
+        self.assertTrue(mx.allclose(cfun(c, a, b), fun(c, a, b)))
+
+        # With alpha and beta
+        fun2 = mx.compile(
+            lambda c, a, b: mx.addmm(c, a, b, alpha=2.0, beta=3.0), shapeless=True
+        )
+        c = mx.ones((2, 4))
+        a = mx.ones((2, 3))
+        b = mx.ones((3, 4))
+        expected = 3.0 * c + 2.0 * (a @ b)
+        self.assertTrue(mx.allclose(fun2(c, a, b), expected))
+
     def test_shapeless_compile_slice_update(self):
         def fun(x):
             x[2] = mx.array([3.0])
@@ -1048,6 +1076,28 @@ class TestCompile(mlx_tests.MLXTestCase):
         d_hat = fun(a, b, c)
         self.assertTrue(mx.allclose(d[0], d_hat[0]))
         self.assertTrue(mx.allclose(d[1], d_hat[1]))
+
+    def test_compile_large_graph_with_broadcasts(self):
+        N = 20
+        _as = [mx.array(2 * i, dtype=mx.float32) for i in range(N)]
+        _bs = [mx.array(i, dtype=mx.float32) for i in range(N)]
+        _c = mx.array(0.0)
+        x = mx.random.normal((2, 2))
+
+        def f(x):
+            y = 0
+            for i in range(N):
+                y = y + _as[i] * x * _bs[i] * _c
+            return y
+
+        ref = f(x)
+        mx.eval(ref)
+        f = mx.compile(f)
+        for i in range(2):
+            y = f(x)
+            mx.eval(y)
+
+        self.assertTrue(mx.allclose(y, ref))
 
     def test_wrap_compiled(self):
         @mx.compile

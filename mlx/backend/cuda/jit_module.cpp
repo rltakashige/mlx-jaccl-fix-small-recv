@@ -26,6 +26,25 @@ void check_nvrtc_error(const char* name, nvrtcResult err) {
   }
 }
 
+// Return the default path to CUDA toolkit.
+const std::filesystem::path& default_cuda_toolkit_path() {
+#if defined(_WIN32)
+  static auto cached_path = []() -> std::filesystem::path {
+    std::filesystem::path root(
+        LR"(C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA)");
+    for (auto& file : std::filesystem::directory_iterator(root)) {
+      if (std::filesystem::exists(file.path() / "include" / "cuda.h")) {
+        return file.path();
+      }
+    }
+    return {};
+  }();
+#else
+  static std::filesystem::path cached_path = "/usr/local/cuda";
+#endif
+  return cached_path;
+}
+
 // Return the --include-path args used for invoking NVRTC.
 const std::vector<std::string>& include_path_args() {
   static std::vector<std::string> cached_args = []() {
@@ -47,26 +66,22 @@ const std::vector<std::string>& include_path_args() {
     // Add path to CUDA runtime headers, try local-installed python package
     // first and then system-installed headers.
     path = root_dir.parent_path() / "nvidia" / "cuda_runtime" / "include";
-    if (std::filesystem::exists(path)) {
-      args.push_back(fmt::format("--include-path={}", path.string()));
-    } else {
+    if (!std::filesystem::exists(path)) {
       const char* home = std::getenv("CUDA_HOME");
       if (!home) {
         home = std::getenv("CUDA_PATH");
       }
-#if defined(__linux__)
-      if (!home) {
-        home = "/usr/local/cuda";
+      path = home ? std::filesystem::path(home) : default_cuda_toolkit_path();
+      if (!path.empty()) {
+        path = path / "include";
       }
-#endif
-      if (home && std::filesystem::exists(home)) {
-        args.push_back(fmt::format("--include-path={}/include", home));
-      } else {
+      if (path.empty() || !std::filesystem::exists(path)) {
         throw std::runtime_error(
             "Can not find locations of CUDA headers, please set environment "
             "variable CUDA_HOME or CUDA_PATH.");
       }
     }
+    args.push_back(fmt::format("--include-path={}", path.string()));
     return args;
   }();
   return cached_args;
@@ -231,6 +246,7 @@ constexpr const char* g_include_names[] = {
     INCLUDE_PREFIX "config.h",
     INCLUDE_PREFIX "complex.cuh",
     INCLUDE_PREFIX "fp16_math.cuh",
+    INCLUDE_PREFIX "hadamard.cuh",
     INCLUDE_PREFIX "indexing.cuh",
     INCLUDE_PREFIX "scatter_ops.cuh",
     INCLUDE_PREFIX "unary_ops.cuh",
@@ -247,6 +263,7 @@ constexpr const char* g_headers[] = {
     jit_source_config,
     jit_source_complex,
     jit_source_fp16_math,
+    jit_source_hadamard,
     jit_source_indexing,
     jit_source_scatter_ops,
     jit_source_unary_ops,

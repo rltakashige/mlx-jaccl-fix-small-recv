@@ -10,17 +10,23 @@
 
 namespace mlx::core::gpu {
 
-void new_stream(Stream s) {
-  // Force initalization of CUDA, so CUDA runtime get destroyed at last.
+void init() {
+  // Force initalization of CUDA, so CUDA runtime get destroyed last.
   cudaFree(nullptr);
   // Make sure CUDA event pool get destroyed after device and stream.
   cu::CudaEvent::init_pool();
-  // Ensure the static stream objects get created.
+}
+
+void new_stream(Stream s) {
   cu::get_command_encoder(s);
 }
 
 void eval(array& arr) {
   nvtx3::scoped_range r("gpu::eval");
+  // Ensure CUDA context is active on this thread. Required when MLX is called
+  // from threads that have not yet established a CUDA context (e.g. thread
+  // pools, language runtimes that migrate work across OS threads).
+  cu::device(arr.primitive().stream().device).make_current();
   auto outputs = arr.outputs();
   {
     // If the array is a tracer hold a reference
