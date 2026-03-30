@@ -67,6 +67,7 @@ from mlx.nn.layers.distributed import (
     QuantizedAllToShardedLinear,
     QuantizedShardedToAllLinear,
     ShardedToAllLinear,
+    compute_shard_sizes,
 )
 from mlx.nn.layers.dropout import Dropout, Dropout2d, Dropout3d
 from mlx.nn.layers.embedding import Embedding
