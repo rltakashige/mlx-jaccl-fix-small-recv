@@ -37,6 +37,36 @@ def _split(weight, segments, axis):
     return mx.split(weight, indices, axis=axis)
 
 
+def compute_shard_sizes(dim: int, N: int) -> list[int]:
+    """Distribute *dim* elements across *N* shards as evenly as possible.
+
+    The first ``dim % N`` shards receive one extra element.
+    """
+    base, rem = divmod(dim, N)
+    return [base + (1 if i < rem else 0) for i in range(N)]
+
+
+def _sizes_to_indices(sizes: list[int]) -> list[int]:
+    """Convert a list of shard sizes to cumulative split indices.
+
+    ``[4, 3, 3]`` → ``[4, 7]``
+    """
+    indices: list[int] = []
+    cumsum = 0
+    for s in sizes[:-1]:
+        cumsum += s
+        indices.append(cumsum)
+    return indices
+
+
+def _uneven_split(weight: mx.array, N: int, axis: int) -> list[mx.array]:
+    """Like ``mx.split(weight, N, axis)`` but allows ``weight.shape[axis] % N != 0``."""
+    dim = weight.shape[axis]
+    if dim % N == 0:
+        return mx.split(weight, N, axis=axis)
+    return mx.split(weight, _sizes_to_indices(compute_shard_sizes(dim, N)), axis=axis)
+
+
 def _shard(
     parameters: dict,
     sharding_predicate: Callable,
@@ -73,7 +103,10 @@ def _shard(
 
         return mx.contiguous(
             mx.concatenate(
-                [_split(part, N, axis)[r] for part in _split(weight, segments, axis)],
+                [
+                    _uneven_split(part, N, axis)[r]
+                    for part in _split(weight, segments, axis)
+                ],
                 axis=axis,
             )
         )
@@ -115,6 +148,80 @@ def _check_sharding(sharding):
         )
 
 
+def _shard_quantized_s2a(
+    parameters: dict,
+    group: mx.distributed.Group,
+    group_size: int,
+    bits: int,
+    segments: Union[int, list] = 1,
+):
+    """Shard quantized parameters for the sharded-to-all case.
+
+    Standard ``_shard`` with ``_uneven_split`` fails here because weight,
+    scales, and biases have different physical sizes on axis -1 (the input
+    dimension).  Independent uneven splits would give inconsistent logical
+    boundaries.
+
+    Instead we split in *logical* space with ``group_size`` alignment, then
+    derive per-parameter physical split indices.
+    """
+    N = group.size()
+    r = group.rank()
+
+    scales = parameters.get("scales")
+    if scales is None:
+        # Not actually quantized — fall back to generic path.
+        return _shard(parameters, _sharded_to_all(segments), group)
+
+    # Number of quantization groups along the input axis.
+    num_quant_groups = scales.shape[-1]
+    group_counts = compute_shard_sizes(num_quant_groups, N)
+
+    weight_ppg = group_size * bits // 32  # packed elements per quant-group
+    scale_ppg = 1  # one scale / one bias per quant-group
+
+    result: dict = {}
+    for key, param in parameters.items():
+        if not isinstance(param, mx.array):
+            result[key] = param
+            continue
+
+        if key == "bias":
+            # Linear bias — not split in sharded-to-all.
+            result[key] = param
+        elif key == "weight":
+            sizes = [gc * weight_ppg for gc in group_counts]
+            indices = _sizes_to_indices(sizes)
+            if segments != 1:
+                seg_parts = _split(param, segments, -1)
+                result[key] = mx.contiguous(
+                    mx.concatenate(
+                        [mx.split(sp, indices, axis=-1)[r] for sp in seg_parts],
+                        axis=-1,
+                    )
+                )
+            else:
+                result[key] = mx.contiguous(mx.split(param, indices, axis=-1)[r])
+        elif key in ("scales", "biases"):
+            sizes = [gc * scale_ppg for gc in group_counts]
+            indices = _sizes_to_indices(sizes)
+            if segments != 1:
+                seg_parts = _split(param, segments, -1)
+                result[key] = mx.contiguous(
+                    mx.concatenate(
+                        [mx.split(sp, indices, axis=-1)[r] for sp in seg_parts],
+                        axis=-1,
+                    )
+                )
+            else:
+                result[key] = mx.contiguous(mx.split(param, indices, axis=-1)[r])
+        else:
+            # Unknown parameter — pass through unchanged.
+            result[key] = param
+
+    return result
+
+
 def shard_inplace(
     module: Module,
     sharding: Union[str, Callable],
@@ -145,14 +252,31 @@ def shard_inplace(
         group (mlx.core.distributed.Group): The distributed group to shard
             across. If not set, the global group will be used. Default: ``None``.
     """
+    group = group or mx.distributed.init()
+
     if isinstance(sharding, str):
         _check_sharding(sharding)
-        sharding = (
-            _all_to_sharded(segments)
-            if sharding == "all-to-sharded"
-            else _sharded_to_all(segments)
-        )
-    module.update(_shard(module.parameters(), sharding, group))
+        is_quantized = hasattr(module, "group_size") and hasattr(module, "bits")
+        if sharding == "sharded-to-all" and is_quantized:
+            module.update(
+                _shard_quantized_s2a(
+                    module.parameters(),
+                    group,
+                    module.group_size,
+                    module.bits,
+                    segments,
+                )
+            )
+        else:
+            predicate = (
+                _all_to_sharded(segments)
+                if sharding == "all-to-sharded"
+                else _sharded_to_all(segments)
+            )
+            module.update(_shard(module.parameters(), predicate, group))
+    else:
+        # Custom callable predicate.
+        module.update(_shard(module.parameters(), sharding, group))
 
 
 def shard_linear(
@@ -179,15 +303,45 @@ def shard_linear(
             across. If not set, the global group will be used. Default: ``None``.
     """
     _check_sharding(sharding)
-    fns = {
-        ("all-to-sharded", True): AllToShardedLinear.from_linear,
-        ("all-to-sharded", False): QuantizedAllToShardedLinear.from_quantized_linear,
-        ("sharded-to-all", True): ShardedToAllLinear.from_linear,
-        ("sharded-to-all", False): QuantizedShardedToAllLinear.from_quantized_linear,
+    group = group or mx.distributed.init()
+
+    is_linear = isinstance(module, Linear)
+
+    cls_map = {
+        ("all-to-sharded", True): AllToShardedLinear,
+        ("all-to-sharded", False): QuantizedAllToShardedLinear,
+        ("sharded-to-all", True): ShardedToAllLinear,
+        ("sharded-to-all", False): QuantizedShardedToAllLinear,
     }
-    return fns[sharding, isinstance(module, Linear)](
-        module, segments=segments, group=group
-    )
+    cls = cls_map[sharding, is_linear]
+
+    # Bypass __init__ — avoids dim % N validation and throwaway weight alloc.
+    sl = cls.__new__(cls)
+    Module.__init__(sl)
+    sl.group = group
+    if not is_linear:
+        sl.group_size = module.group_size
+        sl.bits = module.bits
+
+    # Shard parameters.
+    if sharding == "sharded-to-all" and not is_linear:
+        sl.update(
+            _shard_quantized_s2a(
+                module.parameters(), group, module.group_size, module.bits, segments
+            )
+        )
+    else:
+        predicate = (
+            _all_to_sharded(segments)
+            if sharding == "all-to-sharded"
+            else _sharded_to_all(segments)
+        )
+        sl.update(_shard(module.parameters(), predicate, group))
+
+    if not is_linear:
+        sl.freeze()
+
+    return sl
 
 
 class AllToShardedLinear(Module):
