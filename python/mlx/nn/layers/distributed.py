@@ -57,17 +57,17 @@ def compute_shard_sizes(
     sum to exactly *dim*.
     """
     assert unit >= 1, f"unit must be >= 1, got {unit}"
-
-    # When dim is not divisible by unit, distribute the aligned portion
-    # evenly and give the remainder to the last shard.
-    remainder = dim % unit if unit > 1 else 0
+    if unit > 1:
+        assert dim % unit == 0, f"dim ({dim}) must be divisible by unit ({unit})"
+    assert dim // unit >= N, (
+        f"not enough units to distribute: dim={dim}, unit={unit}, "
+        f"n_units={dim // unit}, N={N}"
+    )
     n_units = dim // unit
 
     if weights is None:
         base, rem = divmod(n_units, N)
-        sizes = [(base + (1 if i < rem else 0)) * unit for i in range(N)]
-        sizes[-1] += remainder
-        return sizes
+        return [(base + (1 if i < rem else 0)) * unit for i in range(N)]
 
     assert len(weights) == N, f"len(weights) ({len(weights)}) must equal N ({N})"
     assert all(w > 0 for w in weights), "all weights must be positive"
@@ -98,15 +98,11 @@ def compute_shard_sizes(
             counts[i] += 1
             diff += 1
 
-    sizes = [c * unit for c in counts]
-    sizes[-1] += remainder
-    return sizes
-
     return [c * unit for c in counts]
 
 
-def _sizes_to_indices(sizes: list[int]) -> list[int]:
-    """Convert a list of shard sizes to cumulative split indices.
+def _sizes_to_boundary_indices(sizes: list[int]) -> list[int]:
+    """Convert a list of shard sizes to cumulative split boundary indices.
 
     ``[4, 3, 3]`` → ``[4, 7]``
     """
@@ -135,7 +131,7 @@ def _uneven_split(
         return mx.split(weight, N, axis=axis)
     return mx.split(
         weight,
-        _sizes_to_indices(compute_shard_sizes(dim, N, unit, weights)),
+        _sizes_to_boundary_indices(compute_shard_sizes(dim, N, unit, weights)),
         axis=axis,
     )
 
@@ -224,22 +220,38 @@ def _sharded_to_all(segments, unit=1, weights=None):
     return _shard_fn
 
 
-def _pad_output_dim(parameters: dict, pad_size: int) -> dict:
-    """Pad axis 0 of every array in *parameters* with *pad_size* zero rows.
+def _shard_quantized_a2s(
+    parameters: dict,
+    group: mx.distributed.Group,
+    group_size: int,
+    segments: Union[int, list] = 1,
+    unit: int = 1,
+    weights: Optional[list[float]] = None,
+):
+    """Shard quantized parameters for the all-to-sharded case.
 
-    Used to align the output dimension of quantized all-to-sharded layers
-    to the next multiple of ``group_size`` so that shard sizes match the
-    paired sharded-to-all layer's group-aligned input dimension.
+    When *unit* >= *group_size*, pads the output dimension (axis 0) to the
+    next multiple of *group_size* before splitting.  This ensures shard sizes
+    match the paired sharded-to-all layer's group-aligned input dimension.
     """
-    result: dict = {}
-    for k, v in parameters.items():
-        if isinstance(v, mx.array):
-            pad_shape = list(v.shape)
-            pad_shape[0] = pad_size
-            result[k] = mx.concatenate([v, mx.zeros(pad_shape, dtype=v.dtype)], axis=0)
-        else:
-            result[k] = v
-    return result
+    if unit >= group_size:
+        output_dim = parameters["weight"].shape[0]
+        padded = ((output_dim + group_size - 1) // group_size) * group_size
+        pad_size = padded - output_dim
+        if pad_size > 0:
+            padded_params: dict = {}
+            for k, v in parameters.items():
+                if isinstance(v, mx.array):
+                    pad_shape = list(v.shape)
+                    pad_shape[0] = pad_size
+                    padded_params[k] = mx.concatenate(
+                        [v, mx.zeros(pad_shape, dtype=v.dtype)], axis=0
+                    )
+                else:
+                    padded_params[k] = v
+            parameters = padded_params
+
+    return _shard(parameters, _all_to_sharded(segments, unit, weights), group)
 
 
 def _check_sharding(sharding):
@@ -302,7 +314,7 @@ def _shard_quantized_s2a(
             result[key] = param
         elif key == "weight":
             sizes = [gc * weight_ppg for gc in group_counts]
-            indices = _sizes_to_indices(sizes)
+            indices = _sizes_to_boundary_indices(sizes)
             if segments != 1:
                 seg_parts = _split(param, segments, -1)
                 result[key] = mx.contiguous(
@@ -315,7 +327,7 @@ def _shard_quantized_s2a(
                 result[key] = mx.contiguous(mx.split(param, indices, axis=-1)[r])
         elif key in ("scales", "biases"):
             sizes = [gc * scale_ppg for gc in group_counts]
-            indices = _sizes_to_indices(sizes)
+            indices = _sizes_to_boundary_indices(sizes)
             if segments != 1:
                 seg_parts = _split(param, segments, -1)
                 result[key] = mx.contiguous(
@@ -388,16 +400,16 @@ def shard_inplace(
                 )
             )
         elif sharding == "all-to-sharded" and is_quantized:
-            gs = module.group_size
-            params = module.parameters()
-            if unit >= gs:
-                output_dim = params["weight"].shape[0]
-                padded = ((output_dim + gs - 1) // gs) * gs
-                pad_size = padded - output_dim
-                if pad_size > 0:
-                    params = _pad_output_dim(params, pad_size)
-            predicate = _all_to_sharded(segments, unit, weights)
-            module.update(_shard(params, predicate, group))
+            module.update(
+                _shard_quantized_a2s(
+                    module.parameters(),
+                    group,
+                    module.group_size,
+                    segments,
+                    unit,
+                    weights,
+                )
+            )
         else:
             predicate = (
                 _all_to_sharded(segments, unit, weights)
@@ -465,7 +477,7 @@ def shard_linear(
     # Shard parameters — use setattr since the bare module has no keys yet.
     params = module.parameters()
 
-    if sharding == "sharded-to-all" and not is_linear:
+    if cls is QuantizedShardedToAllLinear:
         sharded = _shard_quantized_s2a(
             params,
             group,
@@ -475,19 +487,15 @@ def shard_linear(
             unit,
             weights,
         )
-    elif sharding == "all-to-sharded" and not is_linear:
-        # Pad output dim to next multiple of group_size so a2s shard sizes
-        # match the paired s2a layer's group-aligned input dimension.
-        # Only when the caller requests group-aligned splitting (unit >= gs).
-        gs = module.group_size
-        if unit >= gs:
-            output_dim = params["weight"].shape[0]
-            padded = ((output_dim + gs - 1) // gs) * gs
-            pad_size = padded - output_dim
-            if pad_size > 0:
-                params = _pad_output_dim(params, pad_size)
-        predicate = _all_to_sharded(segments, unit, weights)
-        sharded = _shard(params, predicate, group)
+    elif cls is QuantizedAllToShardedLinear:
+        sharded = _shard_quantized_a2s(
+            params,
+            group,
+            module.group_size,
+            segments,
+            unit,
+            weights,
+        )
     else:
         predicate = (
             _all_to_sharded(segments, unit, weights)
