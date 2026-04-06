@@ -345,6 +345,13 @@ bool AddMM::is_equivalent(const Primitive& other) const {
   return (alpha_ == a_other.alpha_ && beta_ == a_other.beta_);
 }
 
+std::vector<Shape> AddMM::output_shapes(const std::vector<array>& inputs) {
+  // inputs are {a, b, c}, output shape is a's shape with last dim from b
+  auto out_shape = inputs[0].shape();
+  out_shape.back() = inputs[1].shape(-1);
+  return {std::move(out_shape)};
+}
+
 std::pair<std::vector<array>, std::vector<int>> AddMM::vmap(
     const std::vector<array>& inputs,
     const std::vector<int>& axes) {
@@ -897,7 +904,40 @@ std::vector<array> BroadcastAxes::jvp(
 std::pair<std::vector<array>, std::vector<int>> BroadcastAxes::vmap(
     const std::vector<array>& inputs,
     const std::vector<int>& axes) {
-  throw std::invalid_argument("[BroadcastAxes] VMAP NYI");
+  std::vector<array> new_inputs = inputs;
+  std::vector<int> new_axes = axes;
+  size_t ndim = 0;
+  bool have_batch = false;
+  for (int i = 0; i < inputs.size(); i++) {
+    have_batch |= axes[i] >= 0;
+    ndim = std::max(inputs[i].ndim(), ndim);
+  }
+
+  std::vector<int> expand;
+  expand.reserve(ndim);
+  for (int i = 0; i < inputs.size(); i++) {
+    int extra = ndim - inputs[i].ndim();
+    if (axes[i] >= 0 && extra > 0) {
+      new_axes[i] += extra;
+      expand.resize(extra);
+      std::iota(expand.begin(), expand.end(), 0);
+      new_inputs[i] = expand_dims(new_inputs[i], expand, stream());
+    }
+
+    if (new_axes[i] > 0) {
+      new_inputs[i] = moveaxis(new_inputs[i], new_axes[i], 0, stream());
+    }
+  }
+
+  auto shape = output_shape(new_inputs, ignore_axes_);
+  auto dtype = new_inputs[0].dtype();
+  return {
+      {array(
+          shape,
+          dtype,
+          std::make_shared<BroadcastAxes>(stream(), ignore_axes_),
+          std::move(new_inputs))},
+      {have_batch ? 0 : -1}};
 }
 
 bool BroadcastAxes::is_equivalent(const Primitive& other) const {
@@ -2212,8 +2252,10 @@ std::vector<array> FFT::vjp(
         two,
         one,
         stream());
-    return {
-        multiply(fft::rfftn(cotangents[0], axes, stream()), mask, stream())};
+    return {multiply(
+        fft::rfftn(cotangents[0], axes, fft::FFTNorm::Backward, stream()),
+        mask,
+        stream())};
   } else if (real_) {
     Shape n;
     for (auto ax : axes_) {
@@ -2239,17 +2281,22 @@ std::vector<array> FFT::vjp(
         one,
         stream());
     return {multiply(
-        fft::irfftn(multiply(cotangents[0], mask, stream()), n, axes, stream()),
+        fft::irfftn(
+            multiply(cotangents[0], mask, stream()),
+            n,
+            axes,
+            fft::FFTNorm::Backward,
+            stream()),
         array(n_elements, in.dtype()),
         stream())};
   } else if (inverse_) {
     return {multiply(
-        fft::fftn(cotangents[0], axes, stream()),
+        fft::fftn(cotangents[0], axes, fft::FFTNorm::Backward, stream()),
         array(1 / n_elements, complex64),
         stream())};
   } else {
     return {multiply(
-        fft::ifftn(cotangents[0], axes, stream()),
+        fft::ifftn(cotangents[0], axes, fft::FFTNorm::Backward, stream()),
         array(n_elements, complex64),
         stream())};
   }
@@ -2263,13 +2310,13 @@ std::vector<array> FFT::jvp(
   assert(argnums.size() == 1);
   auto& tan = tangents[0];
   if (real_ & inverse_) {
-    return {fft::irfftn(tan, stream())};
+    return {fft::irfftn(tan, fft::FFTNorm::Backward, stream())};
   } else if (real_) {
-    return {fft::rfftn(tan, stream())};
+    return {fft::rfftn(tan, fft::FFTNorm::Backward, stream())};
   } else if (inverse_) {
-    return {fft::ifftn(tan, stream())};
+    return {fft::ifftn(tan, fft::FFTNorm::Backward, stream())};
   } else {
-    return {fft::fftn(tan, stream())};
+    return {fft::fftn(tan, fft::FFTNorm::Backward, stream())};
   }
 }
 
