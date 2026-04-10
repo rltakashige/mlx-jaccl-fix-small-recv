@@ -65,6 +65,7 @@ void Fence::wait(Stream stream, const array& x) {
         return;
       }
       while (f.cpu_value()[0] < count) {
+        __dsb(0xF);
       }
     });
     return;
