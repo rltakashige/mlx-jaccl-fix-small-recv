@@ -174,7 +174,7 @@ void sdpa_full_self_attention_metal(
     bool do_causal_,
     const std::optional<array>& mask,
     const std::optional<array>& sinks) {
-  if (metal::is_nax_available() && q.shape(3) != 80 &&
+  if (metal::is_nax_available() && q.shape(3) != 80 && q.shape(3) <= 128 &&
       (env::enable_tf32() || q.dtype() != float32)) {
     return sdpa_full_self_attention_nax(
         /* const Stream& s = */ s,
@@ -196,7 +196,7 @@ void sdpa_full_self_attention_metal(
 
   int bd = q.shape(-1);
   int bq = 32;
-  int bk = bd < 128 ? 32 : 16;
+  int bk = (bd < 128) ? 32 : (bd >= 512) ? 128 : 16;
 
   int B = q.shape(0);
   int H = q.shape(1);
@@ -621,7 +621,7 @@ bool ScaledDotProductAttention::use_fallback(
        query_head_dim == 256);
   const bool sdpa_full_supported_head_dim = query_head_dim == value_head_dim &&
       (query_head_dim == 64 || query_head_dim == 80 || query_head_dim == 128 ||
-       (query_head_dim == 256 && q.dtype() != float32));
+       query_head_dim == 256 || query_head_dim == 512);
 
   const bool sdpa_full_supported_mask = !has_mask || has_arr_mask ||
       (query_sequence_length <= key_sequence_length && do_causal);
