@@ -76,12 +76,12 @@ native_bf16_min(const void* input, void* output, size_t N) {
 template <>
 struct SumOp<bfloat16_t> {
   void operator()(const bfloat16_t* input, bfloat16_t* output, size_t N) const {
-    if (has_native_bf16_support()) {
-      native_bf16_sum(input, output, N);
-    } else {
-      for (size_t i = 0; i < N; i++) {
-        output[i] = output[i] + input[i];
-      }
+    // Always use the software path (fp32 add, single RNE round-to-bf16) so
+    // that jaccl bf16 all_sum matches mlx's ring backend SumOp<bf16>
+    // behavior. The native __bf16 FADD path was a suspected source of
+    // divergence under Apple Silicon bf16 semantics (FTZ / tie-breaking).
+    for (size_t i = 0; i < N; i++) {
+      output[i] = output[i] + input[i];
     }
   }
 };

@@ -59,6 +59,15 @@ class MeshImpl {
     int reduce_chunk = 0;
     int reduce_rank = 0;
 
+    // Track which chunk index is currently resident in each staging / send
+    // buff slot, and whether the buff's previous send has completed (so it
+    // is eligible to be refilled with the next chunk). Defer the actual
+    // refill until the reduce sub-loop has consumed the current chunk in
+    // that slot for our own rank; otherwise we would overwrite staging
+    // data that the reduce path still needs to read.
+    bool refill_ready[PIPELINE] = {false};
+    int64_t chunk_in_staging[PIPELINE];
+
     // Total number of chunks
     int64_t total_chunks = (total + N - 1) / N;
 
@@ -75,6 +84,7 @@ class MeshImpl {
           in + read_offset,
           in + read_offset + elems,
           send_buffer(sz, buff).begin<T>());
+      chunk_in_staging[buff] = read_offset / N;
       recv_end[rank_]++;
       post_send_all(sz, buff);
 
@@ -104,24 +114,15 @@ class MeshImpl {
 
         in_flight--;
 
-        if (work_type == SEND_WR && read_offset < total) {
+        if (work_type == SEND_WR) {
           completed_send_count[buff]++;
           if (completed_send_count[buff] == num_peers) {
-            int64_t elems = std::min(N, total - read_offset);
-            std::copy(
-                in + read_offset,
-                in + read_offset + elems,
-                local_staging(buff));
-            std::copy(
-                in + read_offset,
-                in + read_offset + elems,
-                send_buffer(sz, buff).begin<T>());
-            recv_end[rank_]++;
-            post_send_all(sz, buff);
-
+            // Mark this buff as refill-eligible. Actual refill is deferred
+            // until the reduce sub-loop has consumed the chunk currently
+            // resident in this staging slot for our own rank, to avoid
+            // clobbering staging data the reduce is about to read.
+            refill_ready[buff] = true;
             completed_send_count[buff] = 0;
-            in_flight += num_peers;
-            read_offset += N;
           }
         }
 
@@ -181,6 +182,35 @@ class MeshImpl {
           reduce_rank = 0;
           reduce_chunk++;
         }
+      }
+
+      // Deferred refill: for each buff whose send completed, refill and
+      // post its next chunk once the reduce has already consumed this
+      // buff's current chunk on our own rank. The staging slot is safe
+      // to overwrite when (reduce_chunk > chunk_in_staging[b]) or when
+      // we are on that chunk but past our own reduce step.
+      for (int b = 0; b < PIPELINE; b++) {
+        if (!refill_ready[b] || read_offset >= total) {
+          continue;
+        }
+        int64_t k = chunk_in_staging[b];
+        bool consumed =
+            (reduce_chunk > k) || (reduce_chunk == k && reduce_rank > rank_);
+        if (!consumed) {
+          continue;
+        }
+        int64_t elems = std::min(N, total - read_offset);
+        std::copy(in + read_offset, in + read_offset + elems, local_staging(b));
+        std::copy(
+            in + read_offset,
+            in + read_offset + elems,
+            send_buffer(sz, b).begin<T>());
+        chunk_in_staging[b] = read_offset / N;
+        recv_end[rank_]++;
+        post_send_all(sz, b);
+        refill_ready[b] = false;
+        in_flight += num_peers;
+        read_offset += N;
       }
     }
 
