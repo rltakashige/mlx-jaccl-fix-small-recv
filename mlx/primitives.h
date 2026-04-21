@@ -189,8 +189,15 @@ class MLX_API Add : public UnaryPrimitive {
 
 class AddMM : public UnaryPrimitive {
  public:
-  explicit AddMM(Stream stream, float alpha, float beta)
-      : UnaryPrimitive(stream), alpha_(alpha), beta_(beta) {}
+  explicit AddMM(
+      Stream stream,
+      float alpha,
+      float beta,
+      int splitk_override = 0)
+      : UnaryPrimitive(stream),
+        alpha_(alpha),
+        beta_(beta),
+        splitk_override_(splitk_override) {}
 
   void eval_cpu(const std::vector<array>& inputs, array& out) override;
   void eval_gpu(const std::vector<array>& inputs, array& out) override;
@@ -205,9 +212,14 @@ class AddMM : public UnaryPrimitive {
     return {alpha_, beta_};
   };
 
+  int splitk_override() const {
+    return splitk_override_;
+  }
+
  private:
   const float alpha_;
   const float beta_;
+  int splitk_override_;
 };
 
 class Arange : public UnaryPrimitive {
@@ -1432,7 +1444,8 @@ class LogSumExp : public UnaryPrimitive {
 
 class Matmul : public UnaryPrimitive {
  public:
-  explicit Matmul(Stream stream) : UnaryPrimitive(stream) {}
+  explicit Matmul(Stream stream, int splitk_override = 0)
+      : UnaryPrimitive(stream), splitk_override_(splitk_override) {}
 
   void eval_cpu(const std::vector<array>& inputs, array& out) override;
   void eval_gpu(const std::vector<array>& inputs, array& out) override;
@@ -1440,8 +1453,18 @@ class Matmul : public UnaryPrimitive {
   DEFINE_GRADS()
   DEFINE_VMAP()
   DEFINE_NAME(Matmul)
-  DEFINE_DEFAULT_IS_EQUIVALENT()
+  bool is_equivalent(const Primitive& other) const override {
+    const Matmul& m = static_cast<const Matmul&>(other);
+    return splitk_override_ == m.splitk_override_;
+  }
   std::vector<Shape> output_shapes(const std::vector<array>& inputs) override;
+
+  int splitk_override() const {
+    return splitk_override_;
+  }
+
+ private:
+  int splitk_override_;
 };
 
 class Maximum : public UnaryPrimitive {

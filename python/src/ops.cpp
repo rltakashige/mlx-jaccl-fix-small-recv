@@ -672,6 +672,38 @@ void init_ops(nb::module_& m) {
             array: The matrix product of ``a`` and ``b``.
       )pbdoc");
   m.def(
+      "set_splitk_partitions_override",
+      &mx::set_splitk_partitions_override,
+      nb::arg("n"),
+      R"pbdoc(
+        Override the SIMD split-K partition count for subsequent matmul calls
+        on this thread. Pass 0 to clear and restore the heuristic.
+
+        Intended for tensor-parallel inference: the user computes the
+        partition count for the *unsharded* shape via
+        :func:`compute_splitk_partitions` and sets it before invoking each
+        per-rank matmul, so per-rank matmuls produce bit-identical outputs to
+        an unsharded reference.
+      )pbdoc");
+  m.def(
+      "splitk_partitions_override",
+      &mx::splitk_partitions_override,
+      R"pbdoc(
+        Return the current thread-local split-K partition override
+        (0 means the heuristic is in effect).
+      )pbdoc");
+  m.def(
+      "compute_splitk_partitions",
+      &mx::compute_splitk_partitions,
+      nb::arg("M"),
+      nb::arg("N"),
+      nb::arg("K"),
+      R"pbdoc(
+        Return the SIMD split-K partition count the matmul heuristic would
+        choose for a given (M, N, K). Use this to compute the value to pass to
+        :func:`set_splitk_partitions_override` for tensor-parallel calls.
+      )pbdoc");
+  m.def(
       "square",
       [](const ScalarOrArray& a, mx::StreamOrDevice s) {
         return mx::square(to_array(a), s);

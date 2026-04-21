@@ -342,7 +342,9 @@ std::vector<array> AddMM::jvp(
 
 bool AddMM::is_equivalent(const Primitive& other) const {
   const AddMM& a_other = static_cast<const AddMM&>(other);
-  return (alpha_ == a_other.alpha_ && beta_ == a_other.beta_);
+  return (
+      alpha_ == a_other.alpha_ && beta_ == a_other.beta_ &&
+      splitk_override_ == a_other.splitk_override_);
 }
 
 std::vector<Shape> AddMM::output_shapes(const std::vector<array>& inputs) {

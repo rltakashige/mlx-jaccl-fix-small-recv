@@ -3244,10 +3244,12 @@ array matmul(
   auto out_shape = a.shape();
   out_shape.back() = b.shape(-1);
 
+  // Snapshot the splitk override at graph-build time so the kernel sees
+  // whatever override was set by the caller regardless of when eval runs.
   auto out = array(
       std::move(out_shape),
       out_type,
-      std::make_shared<Matmul>(to_stream(s)),
+      std::make_shared<Matmul>(to_stream(s), splitk_partitions_override()),
       {a, b});
   if (in_a.ndim() > 2 && in_b.ndim() <= 2) {
     auto orig_shape = in_a.shape();
@@ -5534,7 +5536,8 @@ array addmm(
     auto out = array(
         {a.shape(0), b.shape(1)},
         out_type,
-        std::make_shared<AddMM>(to_stream(s), alpha, beta),
+        std::make_shared<AddMM>(
+            to_stream(s), alpha, beta, splitk_partitions_override()),
         {a, b, c});
     return reshape(out, out_shape, s);
   }
@@ -5781,7 +5784,6 @@ array block_masked_mm(
   return axes.empty() ? out : squeeze(out, axes, s);
 }
 
-/** Compute matrix product with matrix-level gather */
 array gather_mm(
     array a,
     array b,

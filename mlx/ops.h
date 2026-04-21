@@ -1050,6 +1050,19 @@ inline array round(const array& a, StreamOrDevice s = {}) {
 /** Matrix-matrix multiplication. */
 MLX_API array matmul(const array& a, const array& b, StreamOrDevice s = {});
 
+/** Override the SIMD split-K partition count for subsequent matmul calls on
+ *  this thread. Pass 0 to clear and restore the heuristic. The override only
+ *  affects the Metal backend's split-K kernel and is intended for
+ *  tensor-parallel callers that want per-rank matmuls to use the same K-fold
+ *  structure as an unsharded reference. */
+MLX_API void set_splitk_partitions_override(int n);
+MLX_API int splitk_partitions_override();
+
+/** Compute the SIMD split-K partition count the matmul heuristic would
+ *  choose for a given (M, N, K). Useful for tensor-parallel callers that
+ *  need to set the override to match what an unsharded matmul would do. */
+MLX_API int compute_splitk_partitions(int M, int N, int K);
+
 /** Gather array entries given indices and slices */
 MLX_API array gather(
     const array& a,

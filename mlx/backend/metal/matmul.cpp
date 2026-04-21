@@ -5,6 +5,7 @@
 #include <numeric>
 #include <sstream>
 
+#include "mlx/api.h"
 #include "mlx/backend/common/broadcasting.h"
 #include "mlx/backend/common/matmul.h"
 #include "mlx/backend/gpu/copy.h"
@@ -19,6 +20,53 @@
 #include "mlx/utils.h"
 
 namespace mlx::core {
+
+namespace {
+// Thread-local override for the SIMD split-K partition count.
+//
+// When set to a positive value, the steel split-K matmul kernels will use
+// this many partitions instead of the value computed by the heuristic. This
+// is used by tensor-parallel inference code that wants per-rank matmuls to
+// produce bit-identical outputs to an unsharded reference: the user computes
+// the partition count for the *unsharded* shape and sets it before invoking
+// each per-rank matmul. Set back to 0 to restore the heuristic.
+thread_local int g_splitk_partitions_override = 0;
+} // namespace
+
+MLX_API void set_splitk_partitions_override(int n) {
+  g_splitk_partitions_override = n;
+}
+
+MLX_API int splitk_partitions_override() {
+  return g_splitk_partitions_override;
+}
+
+MLX_API int compute_splitk_partitions(int M, int N, int K) {
+  // Returns the number of partitions the splitk heuristic would use for this
+  // (M, N, K), or 0 if the splitk path would NOT be dispatched. Tensor-
+  // parallel callers can use the result directly with
+  // ``set_splitk_partitions_override``: a positive value forces per-rank to
+  // use the same partition count as unsharded; 0 means "unsharded would not
+  // have used splitk", in which case per-rank should also skip it via
+  // ``set_splitk_partitions_override(-1)``.
+  int _tm = (M + 16 - 1) / 16;
+  int _tn = (N + 16 - 1) / 16;
+  int _tk = K / 16;
+  // Match the dispatch condition in steel_matmul_axpby (Case 1).
+  // Conservative: assume non-NAX path. NAX dispatches differently and the
+  // override semantics are the same for it.
+  constexpr int min_tmn_threshold_default = 1024;
+  if (_tm * _tn > min_tmn_threshold_default || _tk < 8 || K < std::max(M, N)) {
+    return 0;
+  }
+  // Inside splitk: partition formula uses _tm32 / _tn32 (not /16).
+  int _tm32 = (M + 32 - 1) / 32;
+  int _tn32 = (N + 32 - 1) / 32;
+  if (_tm32 == 0 || _tn32 == 0) {
+    return 2;
+  }
+  return std::min(std::max(2, next_power_of_2(_tk / (_tm32 * _tn32))), 32);
+}
 
 namespace {
 
@@ -530,6 +578,10 @@ void steel_gemm_splitk_axpby(
   // As _tk grows use more partitions, as _tm * _tn grow use fewer partitions
   int split_k_partitions =
       std::min(std::max(2, next_power_of_2(_tk / (_tm * _tn))), 32);
+  if (int override_n = splitk_partitions_override(); override_n > 0) {
+    // Clamp to ensure K is divisible cleanly by the partition count
+    split_k_partitions = std::min(override_n, std::max(1, K / 16));
+  }
   int split_k_partition_stride = M * N;
   int gemm_k_iterations = (K / bk) / split_k_partitions;
   int split_k_partition_size = gemm_k_iterations * bk;
@@ -695,6 +747,11 @@ void steel_gemm_splitk_axpby_nax(
   // Determine how many partitions to split K into
   int split_k_partitions =
       (K + split_k_partition_size - 1) / split_k_partition_size;
+  if (int override_n = splitk_partitions_override(); override_n > 0) {
+    split_k_partitions = std::min(override_n, std::max(1, K / bk));
+    split_k_partition_size =
+        ((K + split_k_partitions - 1) / split_k_partitions + bk - 1) / bk * bk;
+  }
   const int bk_iters_per_partition = split_k_partition_size / bk;
   const int split_k_partition_stride = M * N;
 
@@ -920,8 +977,11 @@ void steel_matmul_axpby(
 
   // Case 1: Small M×N with large K, use SIMD split-K
   // Max and Ultra dispatch larger sizes to splitk
+  // splitk_partitions_override() == -1 forces the regular gemm path (used by
+  // tensor-parallel callers when the unsharded shape would not have hit
+  // splitk so per-rank must skip it too for bit-identical output).
   if (!use_nax && batch_size_out == 1 && (_tm * _tn) <= min_tmn_threshold &&
-      _tk >= 8 && K >= std::max(M, N)) {
+      _tk >= 8 && K >= std::max(M, N) && splitk_partitions_override() != -1) {
     return steel_gemm_splitk_axpby<CHECK_AB>(
         /* const Stream& s = */ s,
         /* metal::Device& d = */ d,
@@ -945,7 +1005,8 @@ void steel_matmul_axpby(
   // Case 2: Large K with sufficient M, N, and NAX is available, use NAX split-K
   if (use_nax && batch_size_out == 1 &&
       (K >= 3 * std::max(M, N) ||
-       (std::max(M, N) <= 1024 && K > 2 * std::max(M, N)))) {
+       (std::max(M, N) <= 1024 && K > 2 * std::max(M, N))) &&
+      splitk_partitions_override() != -1) {
     return steel_gemm_splitk_axpby_nax<CHECK_AB>(
         /* const Stream& s = */ s,
         /* metal::Device& d = */ d,
@@ -1222,7 +1283,24 @@ inline void gemv(
 // Matmul implementation
 ///////////////////////////////////////////////////////////////////////////////
 
+// RAII helper: snapshot the current splitk override TLS, set it to a new
+// value for the lifetime of this object, restore on destruction. Used by
+// Matmul::eval_gpu so the override the user set at graph-build time is in
+// effect for kernel dispatch even if the TLS has since been cleared.
+namespace {
+struct ScopedSplitkOverride {
+  int prev;
+  explicit ScopedSplitkOverride(int n) : prev(splitk_partitions_override()) {
+    set_splitk_partitions_override(n);
+  }
+  ~ScopedSplitkOverride() {
+    set_splitk_partitions_override(prev);
+  }
+};
+} // namespace
+
 void Matmul::eval_gpu(const std::vector<array>& inputs, array& out) {
+  ScopedSplitkOverride _splitk_scope(splitk_override_);
   assert(inputs.size() == 2);
   if (!issubdtype(out.dtype(), inexact)) {
     throw std::runtime_error("[matmul] dtype must be inexact.");
@@ -1328,6 +1406,7 @@ void Matmul::eval_gpu(const std::vector<array>& inputs, array& out) {
 ///////////////////////////////////////////////////////////////////////////////
 
 void AddMM::eval_gpu(const std::vector<array>& inputs, array& out) {
+  ScopedSplitkOverride _splitk_scope(splitk_override_);
   assert(inputs.size() == 3);
   if (!issubdtype(out.dtype(), floating)) {
     throw std::runtime_error(
@@ -2422,7 +2501,7 @@ void GatherMM::eval_gpu(const std::vector<array>& inputs, array& out) {
     return;
   }
 
-  // Route to gather gemv if any of a or b are vectors
+  // Route to gather gemv if any of a or b are vectors.
   if (M == 1) {
     gather_mv(b, a, rhs_indices, lhs_indices, out, N, K, false, d, s);
     return;
