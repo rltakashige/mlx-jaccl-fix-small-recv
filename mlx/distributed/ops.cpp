@@ -1,6 +1,8 @@
 // Copyright © 2024 Apple Inc.
 
+#include <mutex>
 #include <sstream>
+#include <unordered_map>
 
 #include "mlx/backend/cuda/cuda.h"
 #include "mlx/backend/metal/metal.h"
@@ -18,6 +20,54 @@ Group to_group(std::optional<Group> group) {
   } else {
     return distributed::init();
   }
+}
+
+// Send and Recv have no natural data dependency on each other, so independent
+// siblings on the same comm stream can be reordered by eval. We chain each
+// new Send/Recv to the previous one on the same (group, stream) as a hidden
+// input, forcing eval to dispatch them in construction order.
+struct CommOrderKey {
+  void* group_ptr;
+  int stream_index;
+  bool operator==(const CommOrderKey& o) const {
+    return group_ptr == o.group_ptr && stream_index == o.stream_index;
+  }
+};
+
+struct CommOrderKeyHash {
+  size_t operator()(const CommOrderKey& k) const {
+    return std::hash<void*>()(k.group_ptr) ^
+        (std::hash<int>()(k.stream_index) << 1);
+  }
+};
+
+std::mutex& comm_order_mutex() {
+  static std::mutex m;
+  return m;
+}
+
+std::unordered_map<CommOrderKey, array, CommOrderKeyHash>&
+comm_order_registry() {
+  static std::unordered_map<CommOrderKey, array, CommOrderKeyHash> r;
+  return r;
+}
+
+template <class BuildFn>
+array make_chained(
+    const Group& group,
+    Stream stream,
+    std::vector<array> inputs,
+    BuildFn&& build) {
+  CommOrderKey key{group.raw_group().get(), stream.index};
+  std::lock_guard<std::mutex> lock(comm_order_mutex());
+  auto& reg = comm_order_registry();
+  auto it = reg.find(key);
+  if (it != reg.end()) {
+    inputs.push_back(it->second);
+  }
+  array out = build(std::move(inputs));
+  reg.insert_or_assign(key, out);
+  return out;
 }
 
 } // namespace
@@ -119,8 +169,13 @@ array send(
     throw std::invalid_argument(msg.str());
   }
 
-  return array(
-      x.shape(), x.dtype(), std::make_shared<Send>(stream, group, dst), {x});
+  return make_chained(group, stream, {x}, [&](std::vector<array> inputs) {
+    return array(
+        x.shape(),
+        x.dtype(),
+        std::make_shared<Send>(stream, group, dst),
+        std::move(inputs));
+  });
 }
 
 array recv(
@@ -142,11 +197,14 @@ array recv(
     throw std::invalid_argument(msg.str());
   }
 
-  return array(
-      std::move(shape),
-      std::move(dtype),
-      std::make_shared<Recv>(stream, group, src),
-      std::vector<array>{});
+  return make_chained(
+      group, stream, std::vector<array>{}, [&](std::vector<array> inputs) {
+        return array(
+            std::move(shape),
+            std::move(dtype),
+            std::make_shared<Recv>(stream, group, src),
+            std::move(inputs));
+      });
 }
 
 array recv_like(

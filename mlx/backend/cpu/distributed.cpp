@@ -73,7 +73,7 @@ void AllGather::eval_cpu(
 void Send::eval_cpu(
     const std::vector<array>& inputs,
     std::vector<array>& outputs) {
-  assert(inputs.size() == 1);
+  assert(inputs.size() >= 1);
   assert(outputs.size() == 1);
 
   auto [in, copied] = ensure_row_contiguous(inputs[0], stream());
@@ -88,7 +88,7 @@ void Send::eval_cpu(
 void Recv::eval_cpu(
     const std::vector<array>& inputs,
     std::vector<array>& outputs) {
-  assert(inputs.size() == 0);
+  assert(inputs.size() <= 1);
   assert(outputs.size() == 1);
 
   outputs[0].set_data(allocator::malloc(outputs[0].nbytes()));

@@ -5,11 +5,13 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <cassert>
 #include <chrono>
 #include <fstream>
 #include <future>
 #include <iostream>
 #include <list>
+#include <mutex>
 #include <sstream>
 #include <thread>
 #include <unordered_map>
@@ -794,17 +796,32 @@ class RingGroup : public GroupImpl {
     size_t segment_size =
         std::max(size_t(1024), ceildiv(data_size, sockets.size()));
     std::vector<std::future<void>> sends;
-    for (int i = 0; i < sockets.size(); i++) {
-      if (i * segment_size >= data_size) {
-        break;
+    std::vector<int> used_sockets;
+    {
+      std::lock_guard<std::mutex> lock(sendrecv_counter_mutex_);
+      for (int i = 0; i < sockets.size(); i++) {
+        if (i * segment_size >= data_size) {
+          break;
+        }
+        assert(
+            sendrecv_pending_recvs_[sockets[i]] == 0 &&
+            "ring: recv in flight on same socket while issuing send");
+        sendrecv_pending_sends_[sockets[i]]++;
+        used_sockets.push_back(sockets[i]);
+        sends.emplace_back(comm_.send(
+            sockets[i],
+            data + i * segment_size,
+            std::min(data_size, (i + 1) * segment_size) - i * segment_size));
       }
-      sends.emplace_back(comm_.send(
-          sockets[i],
-          data + i * segment_size,
-          std::min(data_size, (i + 1) * segment_size) - i * segment_size));
     }
     for (auto& f : sends) {
       f.wait();
+    }
+    {
+      std::lock_guard<std::mutex> lock(sendrecv_counter_mutex_);
+      for (int s : used_sockets) {
+        sendrecv_pending_sends_[s]--;
+      }
     }
   }
 
@@ -812,17 +829,32 @@ class RingGroup : public GroupImpl {
     size_t segment_size =
         std::max(size_t(1024), ceildiv(data_size, sockets.size()));
     std::vector<std::future<void>> recvs;
-    for (int i = 0; i < sockets.size(); i++) {
-      if (i * segment_size >= data_size) {
-        break;
+    std::vector<int> used_sockets;
+    {
+      std::lock_guard<std::mutex> lock(sendrecv_counter_mutex_);
+      for (int i = 0; i < sockets.size(); i++) {
+        if (i * segment_size >= data_size) {
+          break;
+        }
+        assert(
+            sendrecv_pending_sends_[sockets[i]] == 0 &&
+            "ring: send in flight on same socket while issuing recv");
+        sendrecv_pending_recvs_[sockets[i]]++;
+        used_sockets.push_back(sockets[i]);
+        recvs.emplace_back(comm_.recv(
+            sockets[i],
+            data + i * segment_size,
+            std::min(data_size, (i + 1) * segment_size) - i * segment_size));
       }
-      recvs.emplace_back(comm_.recv(
-          sockets[i],
-          data + i * segment_size,
-          std::min(data_size, (i + 1) * segment_size) - i * segment_size));
     }
     for (auto& f : recvs) {
       f.wait();
+    }
+    {
+      std::lock_guard<std::mutex> lock(sendrecv_counter_mutex_);
+      for (int s : used_sockets) {
+        sendrecv_pending_recvs_[s]--;
+      }
     }
   }
 
@@ -838,6 +870,12 @@ class RingGroup : public GroupImpl {
   std::vector<int> sockets_left_;
 
   std::vector<char> buffers_;
+
+  // Per-socket counters of in-flight ops from the Send/Recv path only;
+  // all_gather/all_reduce bypass these by calling comm_ directly.
+  std::mutex sendrecv_counter_mutex_;
+  std::unordered_map<int, int> sendrecv_pending_sends_;
+  std::unordered_map<int, int> sendrecv_pending_recvs_;
 };
 
 bool is_available() {
