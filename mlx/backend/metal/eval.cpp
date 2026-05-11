@@ -57,18 +57,28 @@ void eval(array& arr) {
     buffers.erase(it);
   }
 
+  // record_gpu_time/record_buffer_ops write into a process-wide stats table
+  // keyed by stream index, so they are safe to call from Metal's completion-
+  // handler thread without touching the per-thread encoder map.
+  int idx = s.index;
   if (encoder.needs_commit()) {
+    int ops_in_buffer = encoder.buffer_ops();
+    metal::CommandEncoder::record_buffer_ops(idx, ops_in_buffer);
     encoder.end_encoding();
     scheduler::notify_new_task(s);
     command_buffer->addCompletedHandler(
-        [s, buffers = std::move(buffers)](MTL::CommandBuffer* cbuf) {
+        [s, idx, buffers = std::move(buffers)](MTL::CommandBuffer* cbuf) {
+          metal::CommandEncoder::record_gpu_time(
+              idx, cbuf->GPUEndTime() - cbuf->GPUStartTime());
           scheduler::notify_task_completion(s);
           check_error(cbuf);
         });
     encoder.commit();
   } else {
     command_buffer->addCompletedHandler(
-        [buffers = std::move(buffers)](MTL::CommandBuffer* cbuf) {
+        [idx, buffers = std::move(buffers)](MTL::CommandBuffer* cbuf) {
+          metal::CommandEncoder::record_gpu_time(
+              idx, cbuf->GPUEndTime() - cbuf->GPUStartTime());
           check_error(cbuf);
         });
   }
@@ -78,8 +88,15 @@ void finalize(Stream s) {
   auto pool = metal::new_scoped_memory_pool();
   auto& encoder = metal::get_command_encoder(s);
   auto* cb = encoder.get_command_buffer();
+  int idx = s.index;
+  int ops_in_buffer = encoder.buffer_ops();
+  metal::CommandEncoder::record_buffer_ops(idx, ops_in_buffer);
   encoder.end_encoding();
-  cb->addCompletedHandler([](MTL::CommandBuffer* cbuf) { check_error(cbuf); });
+  cb->addCompletedHandler([idx](MTL::CommandBuffer* cbuf) {
+    metal::CommandEncoder::record_gpu_time(
+        idx, cbuf->GPUEndTime() - cbuf->GPUStartTime());
+    check_error(cbuf);
+  });
   encoder.commit();
 }
 

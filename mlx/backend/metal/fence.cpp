@@ -5,6 +5,8 @@
 #include "mlx/utils.h"
 
 #include <arm_acle.h>
+#include <condition_variable>
+#include <mutex>
 
 namespace mlx::core {
 
@@ -39,6 +41,8 @@ struct FenceImpl {
   bool use_fast{false};
   uint32_t count{0};
   void* fence;
+  std::mutex mu;
+  std::condition_variable cv;
 
   std::atomic_uint* cpu_value() {
     return static_cast<std::atomic_uint*>(
@@ -82,6 +86,28 @@ void Fence::wait(Stream stream, const array& x) {
     return;
   }
 
+  // Wait CPU-side for the producer to publish the value before encoding the
+  // GPU spin kernel. Without this, the fence_wait kernel can run through its
+  // entire iteration bound (~7-8s on Apple Silicon) while the producer is
+  // blocked on slow CPU work (e.g. a distributed recv waiting on a slow
+  // peer). The kernel then returns silently — having neither been satisfied
+  // nor signaled failure — and the dependent compute kernel encoded right
+  // after it runs on stale/uninitialized data. On some hardware Metal's 5s
+  // IOGPU watchdog also fires. CPU-gating ensures the kernel sees the
+  // atomic satisfied on iteration 0 and exits in microseconds.
+  auto* cpu_val = f.cpu_value();
+  for (int i = 0; i < 4096; ++i) {
+    if (cpu_val->load(std::memory_order_acquire) >= f.count) {
+      break;
+    }
+  }
+  if (cpu_val->load(std::memory_order_acquire) < f.count) {
+    std::unique_lock<std::mutex> lk(f.mu);
+    f.cv.wait(lk, [&]() {
+      return cpu_val->load(std::memory_order_acquire) >= f.count;
+    });
+  }
+
   // Register outputs to ensure that no kernels which depends on the
   // output starts before this one is done
   compute_encoder.register_output_array(x);
@@ -116,6 +142,14 @@ void Fence::update(Stream stream, const array& x, bool cross_device) {
       // to force the store to the point of coherence.
       f.cpu_value()->store(count, std::memory_order_seq_cst);
       __dsb(0xF);
+      // Wake any GPU-stream waiter that is CPU-blocking on this fence
+      // (see the corresponding cv.wait() in Fence::wait above). The
+      // empty locked region establishes happens-before between the store
+      // and any waiter observing `count` under the mutex.
+      {
+        std::lock_guard<std::mutex> lk(f.mu);
+      }
+      f.cv.notify_all();
     });
     return;
   }
@@ -160,7 +194,13 @@ void Fence::update(Stream stream, const array& x, bool cross_device) {
   compute_encoder.dispatch_threads(kernel_dims, kernel_dims);
 
   compute_encoder.get_command_buffer()->addCompletedHandler(
-      [fence_ = fence_](MTL::CommandBuffer* cbuf) {});
+      [fence_ = fence_](MTL::CommandBuffer* cbuf) {
+        auto& f = *static_cast<FenceImpl*>(fence_.get());
+        {
+          std::lock_guard<std::mutex> lk(f.mu);
+        }
+        f.cv.notify_all();
+      });
 }
 
 } // namespace mlx::core

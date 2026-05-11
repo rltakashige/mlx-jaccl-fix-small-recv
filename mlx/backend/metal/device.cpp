@@ -1,5 +1,8 @@
 // Copyright © 2023-2024 Apple Inc.
 
+#include <array>
+#include <atomic>
+#include <cmath>
 #include <cstdlib>
 #include <sstream>
 
@@ -265,6 +268,7 @@ CommandEncoder::CommandEncoder(
     int index,
     ResidencySet& residency_set)
     : device_(d) {
+  stream_index_ = index;
   auto pool = new_scoped_memory_pool();
   queue_ = NS::TransferPtr(device_.mtl_device()->newCommandQueue());
   if (!queue_) {
@@ -442,9 +446,81 @@ void CommandEncoder::end_encoding() {
   all_inputs_.clear();
 }
 
+namespace {
+
+// Per-stream, process-wide telemetry about the most recently completed
+// command buffer: its GPU runtime (seconds) and the number of ops it
+// contained. Written from Metal's completion thread, read from the eval
+// thread, so accessed via std::atomic. Lives at namespace scope so the
+// completion-handler lambda can refer to it by stream index without
+// touching the per-thread encoder map.
+struct BufferStats {
+  std::atomic<double> gpu_seconds{0.0};
+  std::atomic<int> ops{0};
+};
+
+BufferStats& stats_slot(int stream_index) {
+  static constexpr int kMaxStreams = 64;
+  static std::array<BufferStats, kMaxStreams> table{};
+  if (stream_index < 0 || stream_index >= kMaxStreams) {
+    static BufferStats fallback;
+    return fallback;
+  }
+  return table[stream_index];
+}
+
+// Target GPU runtime per command buffer (seconds). Well under macOS's
+// ~5s IOGPU watchdog so we have headroom even when per-op time fluctuates.
+constexpr double kTargetSecondsPerBuffer = 2.0;
+
+} // namespace
+
+void CommandEncoder::record_gpu_time(int stream_index, double seconds) {
+  // Called from Metal completion thread. Pair the time with the ops count
+  // we're about to read from the encoder so needs_commit() can compute a
+  // per-op rate. The encoder writes its current ops via record_buffer_ops()
+  // immediately before committing on the same thread, so no extra ordering
+  // is required beyond relaxed-atomic.
+  stats_slot(stream_index)
+      .gpu_seconds.store(seconds, std::memory_order_relaxed);
+}
+
+void CommandEncoder::record_buffer_ops(int stream_index, int ops) {
+  stats_slot(stream_index).ops.store(ops, std::memory_order_relaxed);
+}
+
 bool CommandEncoder::needs_commit() const {
   auto [max_ops, max_mb] = device_.get_max_ops_mb_per_buffer();
-  return (buffer_ops_ > max_ops) || ((buffer_sizes_ >> 20) > max_mb);
+  auto& stats = stats_slot(stream_index_);
+  double last_gpu = stats.gpu_seconds.load(std::memory_order_relaxed);
+  int last_ops = stats.ops.load(std::memory_order_relaxed);
+
+  // First buffer ever on this stream — no history. Commit after a single
+  // op so even the heaviest first-prefill kernel can't gang up with
+  // anything else into a >5s buffer. Also treat NaN/inf (which a watchdog-
+  // killed previous buffer might report as a degenerate GPU time) as
+  // "no history" and fall back to per-op commits until we observe a
+  // healthy buffer.
+  int safe_ops;
+  if (!std::isfinite(last_gpu) || last_gpu <= 0.0 || last_ops <= 0) {
+    safe_ops = 1;
+  } else {
+    // Rate-based: keep each buffer near the target GPU runtime by sizing
+    // it inversely to the prior buffer's per-op time.
+    double per_op = last_gpu / static_cast<double>(last_ops);
+    if (per_op <= 0.0) {
+      per_op = 1e-6;
+    }
+    double target_ops_d = kTargetSecondsPerBuffer / per_op;
+    if (target_ops_d < 1.0) {
+      target_ops_d = 1.0;
+    }
+    if (target_ops_d > static_cast<double>(max_ops)) {
+      target_ops_d = static_cast<double>(max_ops);
+    }
+    safe_ops = static_cast<int>(target_ops_d);
+  }
+  return (buffer_ops_ > safe_ops) || ((buffer_sizes_ >> 20) > max_mb);
 }
 
 void CommandEncoder::commit() {

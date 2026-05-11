@@ -112,7 +112,20 @@ class MLX_API CommandEncoder {
   NS::SharedPtr<MTL::CommandBuffer> buffer_;
   int buffer_ops_{0};
   size_t buffer_sizes_{0};
+  int stream_index_{-1};
 
+ public:
+  // Record the GPU runtime (seconds) of a just-completed command buffer for
+  // the stream identified by `stream_index`. Safe to call from any thread,
+  // including Metal completion callbacks. Read by needs_commit() to bound
+  // the next buffer's op count below the 5s IOGPU watchdog.
+  static void record_gpu_time(int stream_index, double seconds);
+  static void record_buffer_ops(int stream_index, int ops);
+  int buffer_ops() const {
+    return buffer_ops_;
+  }
+
+ private:
   // Encoder for issuing GPU commands.
   // The members are used within a single ComputeCommandEncoder and will be
   // reset after calling end_encoding().
