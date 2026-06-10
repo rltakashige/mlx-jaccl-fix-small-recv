@@ -52,10 +52,20 @@ constexpr constant metal::thread_scope thread_scope_system =
       }
     }
     // System-scope atomic load to force GPU cache refresh from SLC
+#if __METAL_VERSION__ >= 410
+    // Metal 4.1 added a parameter to the atomic load builtin; 0 keeps
+    // the prior behaviour (order and scope are unchanged in the AIR).
+    uint cur = __metal_atomic_load_explicit(
+        timestamp,
+        int(metal::memory_order_relaxed),
+        __METAL_MEMORY_SCOPE_SYSTEM__,
+        0);
+#else
     uint cur = __metal_atomic_load_explicit(
         timestamp,
         int(metal::memory_order_relaxed),
         __METAL_MEMORY_SCOPE_SYSTEM__);
+#endif
     if (cur >= value) {
       return;
     }
