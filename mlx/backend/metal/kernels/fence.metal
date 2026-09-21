@@ -51,11 +51,25 @@ constexpr constant metal::thread_scope thread_scope_system =
         return;
       }
     }
-    // System-scope atomic load to force GPU cache refresh from SLC
-    uint cur = __metal_atomic_load_explicit(
-        timestamp,
-        int(metal::memory_order_relaxed),
-        __METAL_MEMORY_SCOPE_SYSTEM__);
+    // Slow path: force a GPU cache refresh from the SLC before re-checking.
+    //
+    // This used to call the internal builtin __metal_atomic_load_explicit()
+    // directly. That builtin lives behind `#pragma METAL internals : enable`,
+    // is undocumented, and its arity changed in the Metal 4.1 compiler
+    // (Xcode 27 / macOS 27 SDK), which rejects the 3-argument form with
+    // "too few arguments to function call, expected 4, have 3".
+    //
+    // The public API below is what upstream mlx uses in this same kernel and
+    // is already proven to compile here: a system-scope seq_cst device fence
+    // followed by a read through the `volatile coherent(system)` pointer.
+    // Ordering is strictly stronger than the previous relaxed atomic load,
+    // and the read is coherent at system scope, so the observable behaviour
+    // (see a value published by another agent) is preserved.
+    metal::atomic_thread_fence(
+        metal::mem_flags::mem_device,
+        metal::memory_order_seq_cst,
+        metal::thread_scope_system);
+    uint cur = timestamp[0];
     if (cur >= value) {
       return;
     }
