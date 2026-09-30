@@ -36,17 +36,26 @@ constexpr constant metal::thread_scope thread_scope_system =
       metal::thread_scope_system);
 }
 
-// single thread kernel to spin wait for timestamp value
+// single thread kernel to spin wait for timestamp value. The volatile read alone
+// can keep returning a stale line; a system-scope atomic load every 4096 spins
+// refreshes it from the system level cache.
 [[kernel]] void fence_wait(
     volatile coherent(system) device uint* timestamp [[buffer(0)]],
     constant uint& value [[buffer(1)]]) {
   while (1) {
-    metal::atomic_thread_fence(
-        metal::mem_flags::mem_device,
-        metal::memory_order_seq_cst,
-        metal::thread_scope_system);
-    if (timestamp[0] >= value) {
-      break;
+    for (uint i = 0; i < 4096; i++) {
+      metal::atomic_thread_fence(
+          metal::mem_flags::mem_device,
+          metal::memory_order_seq_cst,
+          metal::thread_scope_system);
+      if (timestamp[0] >= value) {
+        return;
+      }
+    }
+    uint cur = __metal_atomic_load_explicit(
+        timestamp, int(metal::memory_order_relaxed), __METAL_MEMORY_SCOPE_SYSTEM__);
+    if (cur >= value) {
+      return;
     }
   }
 }
