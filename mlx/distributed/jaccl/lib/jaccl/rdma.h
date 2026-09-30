@@ -4,10 +4,12 @@
 
 #include <infiniband/verbs.h>
 
+#include <cstdlib>
 #include <functional>
 #include <mutex>
 #include <span>
 #include <sstream>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -42,6 +44,31 @@ inline std::pair<int, int64_t> buffer_size_from_message(int64_t msg) {
     }
   }
   return {0, FRAME_SIZE};
+}
+
+// MLX_JACCL_EXACT_SEND=1: a message that fits one buffer class goes as one
+// frame of the smallest class that holds it, and every send carries only the
+// valid bytes. Both ranks must use the same setting.
+inline bool exact_send() {
+  static bool on = [] {
+    const char* v = std::getenv("MLX_JACCL_EXACT_SEND");
+    return v != nullptr && std::string(v) == "1";
+  }();
+  return on;
+}
+
+inline std::pair<int, int64_t> buffer_size_for_message(int64_t msg) {
+  if (exact_send()) {
+    if (__builtin_available(
+            macOS 26.3, iOS 26.3, tvOS 26.3, visionOS 26.3, *)) {
+      for (int k = 0; k < BUFFER_SIZES; k++) {
+        if (FRAME_SIZE * (int64_t(1) << k) >= msg) {
+          return {k, FRAME_SIZE * (int64_t(1) << k)};
+        }
+      }
+    }
+  }
+  return buffer_size_from_message(msg);
 }
 
 } // namespace
@@ -176,10 +203,17 @@ struct Connection {
   void queue_pair_rtr(const Destination& dst);
   void queue_pair_rts();
 
-  void post_send(const SharedBuffer& buff, uint64_t work_request_id) {
+  // A negative length sends the whole buffer.
+  void post_send(
+      const SharedBuffer& buff,
+      uint64_t work_request_id,
+      int64_t length = -1) {
     ibv_send_wr work_request, *bad_work_request;
 
     auto entry = buff.to_scatter_gather_entry(protection_domain);
+    if (length >= 0) {
+      entry.length = static_cast<uint32_t>(length);
+    }
     work_request.wr_id = work_request_id;
     work_request.sg_list = &entry;
     work_request.num_sge = 1;

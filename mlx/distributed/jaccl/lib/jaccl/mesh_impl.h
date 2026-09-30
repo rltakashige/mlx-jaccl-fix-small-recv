@@ -41,7 +41,7 @@ class MeshImpl {
     // Our own data is copied to a staging buffer to ensure we can reduce it in
     // the output when needed.
 
-    auto [sz, buffer_size] = buffer_size_from_message(size * sizeof(T));
+    auto [sz, buffer_size] = buffer_size_for_message(size * sizeof(T));
     int64_t N = buffer_size / sizeof(T);
     constexpr int PIPELINE = 2;
     constexpr int WC_NUM = PIPELINE * MESH_MAX_PEERS * 2;
@@ -78,7 +78,7 @@ class MeshImpl {
           in + read_offset + elems,
           send_buffer(sz, buff).begin<T>());
       recv_end[rank_]++;
-      post_send_all(sz, buff);
+      post_send_all(sz, buff, elems * sizeof(T));
 
       buff++;
       in_flight += 2 * num_peers;
@@ -115,7 +115,7 @@ class MeshImpl {
                 in + read_offset,
                 in + read_offset + elems,
                 send_buffer(sz, buff).begin<T>());
-            post_send_all(sz, buff);
+            post_send_all(sz, buff, elems * sizeof(T));
 
             completed_send_count[buff] = 0;
             in_flight += num_peers;
@@ -212,7 +212,7 @@ class MeshImpl {
     // Fully connected all gather
     char* data = out_ptr;
     char* our_data = out_ptr + rank_ * n_bytes;
-    auto [sz, N] = buffer_size_from_message(n_bytes);
+    auto [sz, N] = buffer_size_for_message(n_bytes);
     constexpr int PIPELINE = 2;
     constexpr int WC_NUM = PIPELINE * MESH_MAX_PEERS * 2;
     int64_t total = static_cast<int64_t>(n_bytes);
@@ -232,7 +232,7 @@ class MeshImpl {
           our_data + read_offset,
           our_data + std::min(read_offset + N, total),
           send_buffer(sz, buff).begin<char>());
-      post_send_all(sz, buff);
+      post_send_all(sz, buff, std::min(N, total - read_offset));
 
       buff++;
       in_flight += 2 * num_peers;
@@ -260,7 +260,7 @@ class MeshImpl {
                 our_data + read_offset,
                 our_data + std::min(read_offset + N, total),
                 send_buffer(sz, buff).begin<char>());
-            post_send_all(sz, buff);
+            post_send_all(sz, buff, std::min(N, total - read_offset));
 
             completed_send_count[buff] = 0;
             in_flight += num_peers;
@@ -558,14 +558,16 @@ class MeshImpl {
     return buffers_[sz * NUM_BUFFERS * size_ + buff * size_ + rank];
   }
 
-  void post_send_all(int sz, int buff) {
+  // With exact_send() only `length` valid bytes go out, else the buffer.
+  void post_send_all(int sz, int buff, int64_t length = -1) {
     auto& b = send_buffer(sz, buff);
     int wr_id = SEND_WR << 16 | buff << 8;
+    int64_t len = exact_send() ? length : -1;
     for (int i = 0; i < size_; i++) {
       if (i == rank_) {
         continue;
       }
-      connections_[i].post_send(b, wr_id | i);
+      connections_[i].post_send(b, wr_id | i, len);
     }
   }
 
