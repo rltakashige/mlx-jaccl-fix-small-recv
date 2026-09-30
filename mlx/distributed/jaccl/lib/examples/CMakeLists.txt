@@ -39,3 +39,4 @@ build_example(minimal_barrier.cpp)
 
 # Benchmarks
 build_example(allreduce_bench.cpp)
+build_example(provider_probe.cpp)
