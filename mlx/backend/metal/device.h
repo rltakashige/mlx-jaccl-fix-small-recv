@@ -47,6 +47,9 @@ class MLX_API CommandEncoder {
   void set_buffer(const MTL::Buffer* buf, int idx, int64_t offset = 0);
   void set_input_array(const array& a, int idx, int64_t offset = 0);
   void set_output_array(array& a, int idx, int64_t offset = 0);
+  // Set a raw buffer that the kernel writes. Unlike set_buffer, it takes part
+  // in the barrier tracking of this encoder.
+  void set_output_buffer(const MTL::Buffer* buf, int idx);
   void register_output_array(const array& a);
 
   void add_temporary(array arr);

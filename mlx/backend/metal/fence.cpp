@@ -103,12 +103,33 @@ uint32_t Fence::update(Stream stream, const array& x, bool cross_device) {
 
   auto& d = metal::device(stream.device);
   auto& compute_encoder = metal::get_command_encoder(stream);
+  auto buf = static_cast<MTL::Buffer*>(f.fence);
+  uint32_t nwords = cross_device
+      ? (x.data_size() * x.itemsize() + sizeof(uint32_t) - 1) / sizeof(uint32_t)
+      : 0;
+
+  // Small cross-device case: one threadgroup does the coherence pass and then
+  // the value update, so no separate dispatch and no full barrier.
+  if (cross_device && nwords <= env::metal_fence_fold_max_bytes() / 4) {
+    auto kernel = d.get_kernel("input_coherent_fence_update");
+    size_t tg = std::min<size_t>(1024, kernel->maxTotalThreadsPerThreadgroup());
+    compute_encoder.set_compute_pipeline_state(kernel);
+    compute_encoder.set_input_array(x, 0);
+    compute_encoder.set_bytes(nwords, 1);
+    // Tracked so that updates of this fence stay in order.
+    compute_encoder.set_output_buffer(buf, 2);
+    compute_encoder.set_bytes(f.count, 3);
+    compute_encoder.dispatch_threadgroups(
+        MTL::Size(1, 1, 1), MTL::Size(tg, 1, 1));
+    compute_encoder.get_command_buffer()->addCompletedHandler(
+        [fence_ = fence_](MTL::CommandBuffer* cbuf) {});
+    return f.count;
+  }
 
   // Launch input visibility kernels
   if (cross_device) {
     auto kernel = d.get_kernel("input_coherent");
-    uint32_t nthreads = (x.data_size() * x.itemsize() + sizeof(uint32_t) - 1) /
-        sizeof(uint32_t);
+    uint32_t nthreads = nwords;
     MTL::Size group_dims = MTL::Size(1024, 1, 1);
     MTL::Size grid_dims = MTL::Size((nthreads + 1024 - 1) / 1024, 1, 1);
     compute_encoder.set_compute_pipeline_state(kernel);
@@ -125,8 +146,7 @@ uint32_t Fence::update(Stream stream, const array& x, bool cross_device) {
   MTL::Size kernel_dims = MTL::Size(1, 1, 1);
   compute_encoder.set_compute_pipeline_state(kernel);
 
-  auto buf = static_cast<MTL::Buffer*>(f.fence);
-  compute_encoder.set_buffer(buf, 0);
+  compute_encoder.set_output_buffer(buf, 0);
   compute_encoder.set_bytes(f.count, 1);
   compute_encoder.dispatch_threads(kernel_dims, kernel_dims);
 

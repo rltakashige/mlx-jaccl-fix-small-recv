@@ -366,6 +366,16 @@ void CommandEncoder::set_output_array(
   register_output_array(a);
 }
 
+void CommandEncoder::set_output_buffer(const MTL::Buffer* buf, int idx) {
+  auto r = static_cast<MTL::Resource*>(const_cast<MTL::Buffer*>(buf));
+  needs_barrier_ = needs_barrier_ ||
+      (prev_outputs_.find(r) != prev_outputs_.end()) ||
+      (prev_inputs_.find(r) != prev_inputs_.end());
+  next_inputs_.insert(r);
+  next_outputs_.insert(r);
+  set_buffer(buf, idx);
+}
+
 void CommandEncoder::register_output_array(const array& a) {
   all_outputs_.insert(a.buffer().ptr());
 

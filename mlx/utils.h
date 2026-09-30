@@ -229,6 +229,14 @@ inline bool metal_fast_synch() {
   return metal_fast_synch;
 }
 
+// Largest array (in bytes) for which the fence coherence pass and value
+// update run as one dispatch. 0 disables it.
+inline int64_t metal_fence_fold_max_bytes() {
+  static int64_t max_bytes_ =
+      int64_t(get_var("MLX_METAL_FENCE_FOLD_MAX_KB", 64)) * 1024;
+  return max_bytes_;
+}
+
 inline bool enable_tf32() {
   static bool enable_tf32_ = get_var("MLX_ENABLE_TF32", 1);
   return enable_tf32_;
