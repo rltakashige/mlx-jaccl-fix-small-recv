@@ -2,9 +2,30 @@
 
 #pragma once
 
+#include <functional>
+#include <string>
+
 #include "mlx/distributed/distributed.h"
 
 namespace mlx::core::distributed::detail {
+
+/**
+ * A two-rank all_sum done by GPU kernels over a GPU-visible region that the
+ * group sends from and receives into. See jaccl/gpu_channel.h.
+ */
+struct GpuAllSumChannel {
+  void* base{nullptr};
+  size_t bytes{0};
+  size_t slot_bytes{0};
+  size_t ctrl_offset{0};
+  size_t send_offset[2]{0, 0};
+  size_t recv_offset[2]{0, 0};
+  std::function<void(uint32_t, size_t)> post;
+  std::function<std::string()> error;
+  // Set by the GPU backend.
+  uint32_t next_seq{0};
+  void* gpu_buffer{nullptr};
+};
 
 /**
  * Abstract base class of a distributed group implementation.
@@ -30,6 +51,11 @@ class GroupImpl {
   virtual void all_min(const array& input, array& output, Stream stream) = 0;
   virtual void
   sum_scatter(const array& input, array& output, Stream stream) = 0;
+
+  // The GPU all_sum channel, or nullptr.
+  virtual GpuAllSumChannel* gpu_all_sum_channel() {
+    return nullptr;
+  }
 };
 
 /* Define the MLX stream that the communication should happen in. */

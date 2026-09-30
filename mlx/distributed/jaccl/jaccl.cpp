@@ -164,8 +164,32 @@ class JACCLGroup : public GroupImpl {
     throw std::runtime_error("[jaccl] Group split not supported.");
   }
 
+  detail::GpuAllSumChannel* gpu_all_sum_channel() override {
+    if (!channel_checked_) {
+      channel_checked_ = true;
+      if (auto c = group_->gpu_channel(); c != nullptr) {
+        channel_ = std::make_unique<detail::GpuAllSumChannel>();
+        channel_->base = c->base;
+        channel_->bytes = c->bytes;
+        channel_->slot_bytes = c->slot_bytes;
+        channel_->ctrl_offset = c->ctrl_offset;
+        for (int b = 0; b < 2; b++) {
+          channel_->send_offset[b] = c->send_offset[b];
+          channel_->recv_offset[b] = c->recv_offset[b];
+        }
+        channel_->post = [g = group_](uint32_t seq, size_t n) {
+          g->gpu_channel_post(seq, n);
+        };
+        channel_->error = [g = group_]() { return g->gpu_channel_error(); };
+      }
+    }
+    return channel_.get();
+  }
+
  private:
   std::shared_ptr<::jaccl::Group> group_;
+  bool channel_checked_{false};
+  std::unique_ptr<detail::GpuAllSumChannel> channel_;
 };
 
 } // namespace

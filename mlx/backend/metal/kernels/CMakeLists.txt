@@ -59,6 +59,7 @@ build_kernel(scaled_dot_product_attention sdpa_vector.h)
 build_kernel(gated_delta_update gated_delta_update.h)
 if(MLX_METAL_VERSION GREATER_EQUAL 320)
   build_kernel(fence)
+  build_kernel(jaccl_allreduce)
 endif()
 
 set(STEEL_HEADERS

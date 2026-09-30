@@ -30,6 +30,24 @@ array all_reduce(
     return x;
   }
   auto stream = detail::communication_stream(group, s);
+  // A sum that fits the GPU channel runs on a GPU stream; other sizes and
+  // types keep the CPU path.
+  if (reduce_type == AllReduce::Sum && metal::is_available()) {
+    auto ch = group.raw_group()->gpu_all_sum_channel();
+    bool type_ok =
+        x.dtype() == bfloat16 || x.dtype() == float16 || x.dtype() == float32;
+    if (ch != nullptr && type_ok && x.nbytes() > 0 &&
+        x.nbytes() <= ch->slot_bytes) {
+      auto st = to_stream(s);
+      if (x.has_primitive() && x.primitive().stream().device == Device::gpu) {
+        stream = x.primitive().stream();
+      } else if (st.device == Device::gpu) {
+        stream = st;
+      } else {
+        stream = default_stream(Device::gpu);
+      }
+    }
+  }
   return array(
       x.shape(),
       x.dtype(),
