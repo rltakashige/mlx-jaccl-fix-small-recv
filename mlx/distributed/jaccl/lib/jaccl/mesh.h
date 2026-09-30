@@ -78,12 +78,28 @@ class MeshGroup : public Group {
    */
   void allocate_buffers();
 
+  /**
+   * Open a second set of queue pairs to the peers, in RTS state. Collective:
+   * every rank must call it at the same point.
+   */
+  std::vector<Connection> connect_extra(
+      const std::vector<std::string>& device_names);
+
+  /**
+   * MLX_JACCL_RECV_RING=1: set up the ring queue pairs and post their
+   * receives.
+   */
+  void initialize_recv_ring(const std::vector<std::string>& device_names);
+
   int rank_;
   int size_;
   SideChannel side_channel_;
   std::vector<Connection> connections_;
   std::vector<SharedBuffer> buffers_;
   std::vector<SharedBuffer> scatter_buffers_;
+  std::vector<Connection> ring_connections_;
+  std::vector<SharedBuffer> ring_send_;
+  std::vector<SharedBuffer> ring_recv_;
 
   MeshImpl mesh_;
 };

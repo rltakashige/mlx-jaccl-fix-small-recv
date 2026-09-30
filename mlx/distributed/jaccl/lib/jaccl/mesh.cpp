@@ -1,5 +1,8 @@
 // Copyright © 2026 Apple Inc.
 
+#include <cstdlib>
+#include <string>
+
 #include "jaccl/mesh.h"
 #include "jaccl/reduction_ops.h"
 #include "jaccl/types.h"
@@ -24,11 +27,79 @@ MeshGroup::MeshGroup(
   // Initialize all the connections and allocate buffers
   initialize();
 
+  const char* ring = std::getenv("MLX_JACCL_RECV_RING");
+  bool use_ring = ring != nullptr && std::string(ring) == "1";
+  if (use_ring) {
+    initialize_recv_ring(device_names);
+  }
+
   // Make sure every node has reached here before continuing
   side_channel_.barrier();
 
   // Create the mesh implementation object
   mesh_ = MeshImpl(rank_, size_, connections_, buffers_, scatter_buffers_);
+  if (use_ring) {
+    mesh_.set_recv_ring(ring_connections_, ring_send_, ring_recv_);
+  }
+}
+
+std::vector<Connection> MeshGroup::connect_extra(
+    const std::vector<std::string>& device_names) {
+  auto conns = create_connections(device_names);
+  for (auto& conn : conns) {
+    if (conn.ctx == nullptr) {
+      continue;
+    }
+    conn.allocate_protection_domain();
+    conn.create_completion_queue(MAX_SEND_WR + MAX_RECV_WR);
+    conn.create_queue_pair();
+  }
+  for (int peer = 0; peer < size_; peer++) {
+    if (peer != rank_) {
+      conns[peer].queue_pair_init();
+    }
+  }
+  std::vector<Destination> info;
+  for (auto& conn : conns) {
+    info.emplace_back(conn.info());
+  }
+  auto all_infos = side_channel_.all_gather(info);
+  for (int peer = 0; peer < size_; peer++) {
+    if (peer == rank_) {
+      continue;
+    }
+    conns[peer].queue_pair_rtr(all_infos[peer][rank_]);
+    conns[peer].queue_pair_rts();
+  }
+  return conns;
+}
+
+void MeshGroup::initialize_recv_ring(
+    const std::vector<std::string>& device_names) {
+  ring_connections_ = connect_extra(device_names);
+  for (int i = 0; i < MESH_PIPELINE; i++) {
+    ring_send_.emplace_back(MAX_BUFFER_SIZE);
+  }
+  for (int p = 0; p < size_ * RING_SLOTS; p++) {
+    ring_recv_.emplace_back(MAX_BUFFER_SIZE);
+  }
+  for (auto& b : ring_send_) {
+    for (auto& conn : ring_connections_) {
+      if (conn.ctx != nullptr) {
+        b.register_to_protection_domain(conn.protection_domain);
+      }
+    }
+  }
+  for (int p = 0; p < size_; p++) {
+    if (p == rank_) {
+      continue;
+    }
+    for (int k = 0; k < RING_SLOTS; k++) {
+      auto& b = ring_recv_[p * RING_SLOTS + k];
+      b.register_to_protection_domain(ring_connections_[p].protection_domain);
+      ring_connections_[p].post_recv(b, RECV_WR << 16 | k << 8 | p);
+    }
+  }
 }
 
 void MeshGroup::initialize() {
@@ -208,7 +279,11 @@ void MeshGroup::all_reduce(
   } else {
     // Small messages are latency bound so use the single phase fully
     // connected all_reduce cause it is a bit better.
-    mesh_.all_reduce(in_ptr, out_ptr, count, reduce_op);
+    if (mesh_.has_recv_ring()) {
+      mesh_.all_reduce_ring(in_ptr, out_ptr, count, reduce_op);
+    } else {
+      mesh_.all_reduce(in_ptr, out_ptr, count, reduce_op);
+    }
   }
 }
 

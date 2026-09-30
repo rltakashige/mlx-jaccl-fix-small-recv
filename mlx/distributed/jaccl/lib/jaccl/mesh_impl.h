@@ -10,6 +10,8 @@
 constexpr int MESH_MAX_PEERS = 8;
 constexpr int MESH_PIPELINE = 2;
 constexpr int64_t MAX_BUFFER_SIZE = FRAME_SIZE * (1 << (BUFFER_SIZES - 1));
+// Receive slots per peer that stay posted on the ring queue pair.
+constexpr int RING_SLOTS = 4;
 
 namespace jaccl {
 
@@ -198,6 +200,140 @@ class MeshImpl {
       ibv_wc wc[WC_NUM];
       int n = poll(connections_, WC_NUM, wc);
       in_flight -= n;
+    }
+  }
+
+  // Use a second set of queue pairs whose receives stay posted. recv holds
+  // RING_SLOTS slots per peer (peer p at p * RING_SLOTS), send holds
+  // MESH_PIPELINE slots. The receives must already be posted.
+  void set_recv_ring(
+      std::span<Connection> conns,
+      std::span<SharedBuffer> send,
+      std::span<SharedBuffer> recv) {
+    ring_connections_ = conns;
+    ring_send_ = send;
+    ring_recv_ = recv;
+    for (int p = 0; p < MESH_MAX_PEERS; p++) {
+      ring_arrived_[p] = 0;
+      ring_consumed_[p] = 0;
+    }
+  }
+
+  bool has_recv_ring() const {
+    return !ring_connections_.empty();
+  }
+
+  // Same result as all_reduce (rank order, same reduce_op), but the receives
+  // come from the pre-posted ring, so no post_recv sits on the critical path.
+  template <typename T, typename ReduceOp>
+  void all_reduce_ring(const T* in, T* out, int64_t total, ReduceOp reduce_op) {
+    auto [sz, buffer_size] = buffer_size_for_message(total * sizeof(T));
+    int64_t N = buffer_size / sizeof(T);
+    constexpr int PIPELINE = MESH_PIPELINE;
+    constexpr int WC_NUM = PIPELINE * MESH_MAX_PEERS * 2;
+    int num_peers = size_ - 1;
+    int64_t chunks = (total + N - 1) / N;
+
+    auto staging = [&](int64_t c) -> T* {
+      return reinterpret_cast<T*>(
+          staging_mem_.get() + (c % PIPELINE) * MAX_BUFFER_SIZE);
+    };
+    int64_t base[MESH_MAX_PEERS];
+    for (int p = 0; p < size_; p++) {
+      base[p] = ring_consumed_[p];
+    }
+
+    int64_t posted = 0;
+    int64_t reduced = 0;
+    int sends_done[PIPELINE] = {0};
+    int in_flight = 0;
+
+    auto post_chunk = [&](int64_t c) {
+      int b = c % PIPELINE;
+      int64_t off = c * N;
+      int64_t elems = std::min(N, total - off);
+      std::copy(in + off, in + off + elems, staging(c));
+      std::copy(in + off, in + off + elems, ring_send_[b].begin<T>());
+      int64_t len = exact_send() ? elems * sizeof(T) : buffer_size;
+      for (int p = 0; p < size_; p++) {
+        if (p == rank_) {
+          continue;
+        }
+        ring_connections_[p].post_send(
+            ring_send_[b], SEND_WR << 16 | b << 8 | p, len);
+      }
+      sends_done[b] = 0;
+      in_flight += num_peers;
+    };
+    // Slot b takes chunk c + PIPELINE once chunk c is sent and reduced.
+    auto post_ready = [&]() {
+      while (posted < chunks &&
+             (posted < PIPELINE ||
+              (sends_done[posted % PIPELINE] == num_peers &&
+               reduced > posted - PIPELINE))) {
+        post_chunk(posted++);
+      }
+    };
+    auto poll_ring = [&]() {
+      ibv_wc wc[WC_NUM];
+      int n = poll(ring_connections_, WC_NUM, wc);
+      for (int i = 0; i < n; i++) {
+        check_wc(wc[i]);
+        int work_type = wc[i].wr_id >> 16;
+        int b = (wc[i].wr_id >> 8) & 0xff;
+        int p = wc[i].wr_id & 0xff;
+        if (work_type == SEND_WR) {
+          sends_done[b]++;
+          in_flight--;
+        } else {
+          ring_arrived_[p]++;
+        }
+      }
+    };
+
+    post_ready();
+    while (reduced < chunks) {
+      poll_ring();
+      while (reduced < chunks) {
+        bool ready = true;
+        for (int p = 0; p < size_; p++) {
+          if (p != rank_ && ring_arrived_[p] <= base[p] + reduced) {
+            ready = false;
+          }
+        }
+        if (!ready) {
+          break;
+        }
+        int64_t off = reduced * N;
+        int64_t elems = std::min(N, total - off);
+        for (int r = 0; r < size_; r++) {
+          const T* src = (r == rank_)
+              ? staging(reduced)
+              : ring_recv_[r * RING_SLOTS + (base[r] + reduced) % RING_SLOTS]
+                    .template begin<T>();
+          if (r == 0) {
+            std::copy_n(src, elems, out + off);
+          } else {
+            reduce_op(src, out + off, elems);
+          }
+        }
+        for (int p = 0; p < size_; p++) {
+          if (p == rank_) {
+            continue;
+          }
+          int slot = (base[p] + reduced) % RING_SLOTS;
+          ring_connections_[p].post_recv(
+              ring_recv_[p * RING_SLOTS + slot], RECV_WR << 16 | slot << 8 | p);
+          ring_consumed_[p]++;
+        }
+        reduced++;
+      }
+      post_ready();
+    }
+
+    // Wait for our sends. Receives for later calls are only counted.
+    while (in_flight > 0) {
+      poll_ring();
     }
   }
 
@@ -629,6 +765,20 @@ class MeshImpl {
   std::span<SharedBuffer> buffers_;
   std::span<SharedBuffer> scatter_buffers_;
   std::unique_ptr<char[]> staging_mem_;
+
+  static void check_wc(const ibv_wc& wc) {
+    if (wc.status != IBV_WC_SUCCESS) {
+      std::ostringstream msg;
+      msg << "[jaccl] Work completion failed with status " << wc.status;
+      throw std::runtime_error(msg.str());
+    }
+  }
+
+  std::span<Connection> ring_connections_;
+  std::span<SharedBuffer> ring_send_;
+  std::span<SharedBuffer> ring_recv_;
+  int64_t ring_arrived_[MESH_MAX_PEERS] = {0};
+  int64_t ring_consumed_[MESH_MAX_PEERS] = {0};
 };
 
 } // namespace jaccl
