@@ -33,6 +33,15 @@ MeshGroup::MeshGroup(
     initialize_recv_ring(device_names);
   }
 
+  // MLX_JACCL_GPU_ALLREDUCE=1: a channel for all_sum done by GPU kernels.
+  const char* gpu = std::getenv("MLX_JACCL_GPU_ALLREDUCE");
+  if (gpu != nullptr && std::string(gpu) == "1" && size_ == 2) {
+    const char* kb = std::getenv("MLX_JACCL_GPU_ALLREDUCE_MAX_KB");
+    size_t slot = static_cast<size_t>(kb ? std::atol(kb) : 64) * 1024;
+    gpu_channel_ = std::make_unique<GpuChannelImpl>(
+        rank_, connect_extra(device_names), slot);
+  }
+
   // Make sure every node has reached here before continuing
   side_channel_.barrier();
 

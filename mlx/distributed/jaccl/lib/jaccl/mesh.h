@@ -2,6 +2,7 @@
 
 #pragma once
 
+#include "jaccl/gpu_channel.h"
 #include "jaccl/group.h"
 #include "jaccl/mesh_impl.h"
 #include "jaccl/rdma.h"
@@ -50,6 +51,18 @@ class MeshGroup : public Group {
   void recv(void* output, size_t n_bytes, int src) override;
 
   void barrier() override;
+
+  const GpuChannel* gpu_channel() override {
+    return gpu_channel_ ? &gpu_channel_->info() : nullptr;
+  }
+
+  void gpu_channel_post(uint32_t seq, size_t n_bytes) override {
+    gpu_channel_->post(seq, n_bytes);
+  }
+
+  std::string gpu_channel_error() override {
+    return gpu_channel_ ? gpu_channel_->error_message() : std::string();
+  }
 
  private:
   template <typename T, typename ReduceOp>
@@ -100,6 +113,7 @@ class MeshGroup : public Group {
   std::vector<Connection> ring_connections_;
   std::vector<SharedBuffer> ring_send_;
   std::vector<SharedBuffer> ring_recv_;
+  std::unique_ptr<GpuChannelImpl> gpu_channel_;
 
   MeshImpl mesh_;
 };

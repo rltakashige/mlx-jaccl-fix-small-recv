@@ -4,8 +4,30 @@
 
 #include <cstddef>
 #include <memory>
+#include <string>
 
 namespace jaccl {
+
+/**
+ * A GPU-visible region for a two-rank all_sum done by GPU kernels. The region
+ * is page aligned. Offsets are in bytes from base. The control words are
+ * uint32 at ctrl_offset + 4 * GpuChannel::k*.
+ */
+struct GpuChannel {
+  // Control word indices (each on its own 64-byte line).
+  static constexpr int kSendSeq = 0; // GPU: data for this seq is in the slot
+  static constexpr int kRecvSeq = 16; // CPU: peer data for this seq arrived
+  static constexpr int kConsumed = 32; // GPU: recv slot of this seq is free
+  static constexpr int kError = 48; // CPU: nonzero stops the GPU wait
+  static constexpr int kGpuError = 64; // GPU: seq whose wait stopped on error
+
+  void* base{nullptr};
+  size_t bytes{0};
+  size_t slot_bytes{0};
+  size_t ctrl_offset{0};
+  size_t send_offset[2]{0, 0};
+  size_t recv_offset[2]{0, 0};
+};
 
 /**
  * Abstract base class for a JACCL communication group.
@@ -41,6 +63,27 @@ class Group {
   virtual void send(const void* input, size_t n_bytes, int dst) = 0;
   virtual void recv(void* output, size_t n_bytes, int src) = 0;
   virtual void barrier() = 0;
+
+  /**
+   * The GPU all_sum channel, or nullptr when there is none. It exists for a
+   * two-rank mesh started with MLX_JACCL_GPU_ALLREDUCE=1.
+   */
+  virtual const GpuChannel* gpu_channel() {
+    return nullptr;
+  }
+
+  /**
+   * Tell the channel that a kernel will publish seq with n_bytes in send
+   * slot seq % 2. Calls must come in seq order, starting at 1.
+   */
+  virtual void gpu_channel_post(uint32_t seq, size_t n_bytes) {}
+
+  /**
+   * Text of the channel error, empty when there is none.
+   */
+  virtual std::string gpu_channel_error() {
+    return {};
+  }
 };
 
 /**
