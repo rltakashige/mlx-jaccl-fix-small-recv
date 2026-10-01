@@ -7,8 +7,9 @@
 //   jaccl_provider_probe <rank> <coordinator ip:port> <device to the peer>
 //
 // Probes:
-//   short_send  SEND of 2048 and 10240 valid bytes into 8 KB / 16 KB receives
-//   second_qp   open the device again, a second queue pair, one SEND on it
+//   send_case   one SEND of len bytes into a receive of rcv bytes, each case
+//               on a fresh link (stock JACCL only uses len == rcv == 4K << k)
+//   second_qp   open the device again and bring a second queue pair to RTS
 //   rdma_write  IBV_WR_RDMA_WRITE of 4096 bytes, then a 4-byte flag write
 //   reg_twice   register one page-aligned region with two protection domains
 
@@ -65,42 +66,73 @@ void report(const char* name, bool ok, const std::string& detail) {
             << detail << "\"}" << std::endl;
 }
 
-bool short_send(SideChannel& sc, Link& l, int rank, size_t cls, size_t len) {
-  SharedBuffer rb(cls), sb(cls);
+// One SEND of `len` bytes into a posted receive of `rcv` bytes, on its own
+// fresh link so that a failed case can not leave state for the next one.
+bool send_case(
+    SideChannel& sc,
+    int rank,
+    const std::string& dev,
+    size_t rcv,
+    size_t len) {
+  auto l = connect(sc, rank, dev);
+  size_t cap = std::max(rcv, len);
+  SharedBuffer rb(std::max<size_t>(cap, 16384)),
+      sb(std::max<size_t>(cap, 16384));
   rb.register_to_protection_domain(l.c().protection_domain);
   sb.register_to_protection_domain(l.c().protection_domain);
-  std::memset(rb.data<char>(), 0xEE, cls);
-  for (size_t i = 0; i < cls; i++) {
+  std::memset(rb.data<char>(), 0xEE, rb.size());
+  for (size_t i = 0; i < sb.size(); i++) {
     sb.data<unsigned char>()[i] = static_cast<unsigned char>(i * 7 + rank);
   }
-  l.c().post_recv(rb, RECV_WR << 16);
+  {
+    ibv_sge sge;
+    sge.addr = reinterpret_cast<uintptr_t>(rb.data<char>());
+    sge.length = rcv;
+    sge.lkey = rb.local_key(l.c().protection_domain);
+    ibv_recv_wr wr = {}, *bad = nullptr;
+    wr.wr_id = RECV_WR << 16;
+    wr.sg_list = &sge;
+    wr.num_sge = 1;
+    int st = ibv_post_recv(l.c().queue_pair, &wr, &bad);
+    if (st != 0) {
+      std::ostringstream d;
+      d << "rcv=" << rcv << " len=" << len << " post_recv=" << st;
+      report("send_case", false, d.str());
+      sc.barrier();
+      return false;
+    }
+  }
   sc.barrier();
   l.c().post_send(sb, SEND_WR << 16, len);
-  ibv_wc wc[2];
-  int n = poll_n(l.c(), 2, wc, 5.0);
-  std::ostringstream d;
+  ibv_wc wc[4];
+  int n = poll_n(l.c(), 2, wc, 3.0);
   bool ok = n == 2;
   uint32_t byte_len = 0;
+  int recv_status = -1, send_status = -1;
   for (int i = 0; i < n; i++) {
     ok = ok && wc[i].status == IBV_WC_SUCCESS;
     if ((wc[i].wr_id >> 16) == RECV_WR) {
       byte_len = wc[i].byte_len;
+      recv_status = wc[i].status;
+    } else {
+      send_status = wc[i].status;
     }
   }
-  bool data_ok = true;
+  size_t first_bad = len;
   for (size_t i = 0; i < len; i++) {
     if (rb.data<unsigned char>()[i] !=
         static_cast<unsigned char>(i * 7 + l.peer)) {
-      data_ok = false;
+      first_bad = i;
       break;
     }
   }
-  d << "cls=" << cls << " len=" << len << " completions=" << n
-    << " byte_len=" << byte_len << " data_ok=" << data_ok;
-  for (int i = 0; i < n; i++) {
-    d << " status" << i << "=" << wc[i].status;
-  }
-  report("short_send", ok && data_ok && byte_len == len, d.str());
+  bool data_ok = first_bad == len;
+  std::ostringstream d;
+  d << "rcv=" << rcv << " len=" << len << " completions=" << n
+    << " send_status=" << send_status << " recv_status=" << recv_status
+    << " byte_len=" << byte_len << " data_ok=" << data_ok
+    << " first_bad_byte=" << first_bad;
+  report("send_case", ok && data_ok && byte_len == len, d.str());
   sc.barrier();
   return ok && data_ok;
 }
@@ -218,18 +250,34 @@ int main(int argc, char** argv) {
   TCPAllGather agf(rank, 2, argv[2]);
   SideChannel sc(
       rank, 2, [&](const char* s, char* d, size_t n) { agf(s, d, n); });
-  auto l = connect(sc, rank, argv[3]);
-  sc.barrier();
-  short_send(sc, l, rank, 8192, 2048);
-  short_send(sc, l, rank, 16384, 10240);
-  short_send(sc, l, rank, 16384, 16384);
+  std::string dev = argv[3];
+  // Control first: the shape stock JACCL uses (send = recv = 4 KB << k).
+  size_t cases[][2] = {
+      {16384, 16384},
+      {4096, 4096},
+      {8192, 8192},
+      {16384, 8192},
+      {16384, 12288},
+      {16384, 10240},
+      {8192, 2048},
+      {10240, 10240},
+      {2048, 2048},
+      {65536, 65536},
+      {65536, 40960},
+      {65536, 10240},
+  };
+  for (auto& c : cases) {
+    try {
+      send_case(sc, rank, dev, c[0], c[1]);
+    } catch (std::exception& e) {
+      report("send_case", false, e.what());
+    }
+  }
 
-  bool second_ok = false;
+  auto l = connect(sc, rank, dev);
   try {
-    auto l2 = connect(sc, rank, argv[3]);
-    sc.barrier();
-    second_ok = short_send(sc, l2, rank, 16384, 10240);
-    report("second_qp", second_ok, "second device open + queue pair");
+    auto l2 = connect(sc, rank, dev);
+    report("second_qp", true, "second device open + queue pair to RTS");
     reg_twice(l, l2);
   } catch (std::exception& e) {
     report("second_qp", false, e.what());
