@@ -53,6 +53,8 @@ GpuChannelImpl::GpuChannelImpl(size_t slot_bytes, uint32_t drop_from)
 void GpuChannelImpl::setup(size_t slot_bytes) {
   const char* t = std::getenv("MLX_JACCL_GPU_ALLREDUCE_TIMEOUT_S");
   timeout_s_ = t ? std::atof(t) : 60.0;
+  const char* a = std::getenv("MLX_JACCL_GPU_ALLREDUCE_SEND_ALIGN");
+  send_align_ = a ? std::max<long>(1, std::atol(a)) : 4096;
 
   slot_bytes = round_up(slot_bytes);
   info_.slot_bytes = slot_bytes;
@@ -193,21 +195,24 @@ void GpuChannelImpl::run() {
         }
       }
 
-      // Send exactly n bytes from send slot seq % 2.
+      // Send n bytes rounded up to send_align_ from send slot seq % 2. On the
+      // pair a short send that is not a multiple of 4 KB does not complete.
       char* base = static_cast<char*>(info_.base);
+      size_t wire = std::min(
+          info_.slot_bytes, (n + send_align_ - 1) / send_align_ * send_align_);
       if (loopback_) {
         if (drop_from_ == 0 || seq < drop_from_) {
           prev_.resize(n, 0);
           std::memcpy(base + info_.recv_offset[seq % 2], prev_.data(), n);
           std::memcpy(prev_.data(), base + info_.send_offset[seq % 2], n);
-          recv_len[recv_done % 4] = n;
+          recv_len[recv_done % 4] = wire;
           recv_done++;
         }
       } else {
         ibv_sge sge;
         sge.addr =
             reinterpret_cast<uintptr_t>(base + info_.send_offset[seq % 2]);
-        sge.length = n;
+        sge.length = wire;
         sge.lkey = mr_->lkey;
         ibv_send_wr wr = {}, *bad = nullptr;
         wr.wr_id = SEND_WR << 16 | (seq % 2) << 8 | peer_;
@@ -234,10 +239,10 @@ void GpuChannelImpl::run() {
           throw std::runtime_error(msg.str());
         }
       }
-      if (recv_len[(seq - 1) % 4] != n) {
+      if (recv_len[(seq - 1) % 4] != wire) {
         std::ostringstream msg;
         msg << "[jaccl] GPU channel: all_sum " << seq << " received "
-            << recv_len[(seq - 1) % 4] << " bytes, expected " << n;
+            << recv_len[(seq - 1) % 4] << " bytes, expected " << wire;
         throw std::runtime_error(msg.str());
       }
       word(GpuChannel::kRecvSeq).store(seq, std::memory_order_release);

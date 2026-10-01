@@ -21,7 +21,8 @@ namespace jaccl {
  * Per collective seq (1, 2, ...), slot b = seq % 2:
  *   GPU kernel K1 copies x into send slot b, then stores kSendSeq = seq.
  *   The progress thread sees it, posts the receive for seq + 1 once the GPU
- *   has freed that slot (kConsumed >= seq - 1), sends exactly n_bytes, waits
+ *   has freed that slot (kConsumed >= seq - 1), sends n_bytes rounded up to
+ *   MLX_JACCL_GPU_ALLREDUCE_SEND_ALIGN (default 4096), waits
  *   for the peer's seq in recv slot b and stores kRecvSeq = seq.
  *   GPU kernel K2 waits for kRecvSeq >= seq, adds rank 0 + rank 1, then
  *   stores kConsumed = seq.
@@ -73,6 +74,8 @@ class GpuChannelImpl {
   GpuChannel info_;
   ibv_mr* mr_{nullptr};
   double timeout_s_;
+  // MLX_JACCL_GPU_ALLREDUCE_SEND_ALIGN, default 4096.
+  size_t send_align_{4096};
   bool loopback_{false};
   uint32_t drop_from_{0};
   std::vector<char> prev_;
