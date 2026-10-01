@@ -84,6 +84,8 @@ class MeshGroup : public Group {
   std::vector<Connection> connections_;
   std::vector<SharedBuffer> buffers_;
   std::vector<SharedBuffer> scatter_buffers_;
+  // Send and receive regions of the 2-rank exchange (fast_allsum.h).
+  std::vector<SharedBuffer> exchange_buffers_;
 
   MeshImpl mesh_;
 };

@@ -2,9 +2,14 @@
 
 #pragma once
 
+#include <algorithm>
+#include <cstring>
 #include <memory>
 #include <span>
+#include <stdexcept>
+#include <string>
 
+#include "jaccl/fast_allsum.h"
 #include "jaccl/rdma.h"
 
 constexpr int MESH_MAX_PEERS = 8;
@@ -20,16 +25,122 @@ class MeshImpl {
       int size,
       std::vector<Connection>& conns,
       std::vector<SharedBuffer>& buffers,
-      std::vector<SharedBuffer>& scatter_buffers)
+      std::vector<SharedBuffer>& scatter_buffers,
+      std::vector<SharedBuffer>& exchange_buffers)
       : rank_(rank),
         size_(size),
         connections_(conns),
         buffers_(buffers),
         scatter_buffers_(scatter_buffers),
+        exchange_buffers_(exchange_buffers),
         staging_mem_(
             std::make_unique<char[]>(MESH_PIPELINE * MAX_BUFFER_SIZE)) {}
 
   MeshImpl() : rank_(0), size_(1) {}
+
+  // True when the 2-rank single exchange handles a message of n_bytes.
+  bool can_exchange(size_t n_bytes) const {
+    auto& fast = FastAllSumConfig::get();
+    return fast.enabled && size_ == 2 && exchange_buffers_.size() == 2 &&
+        n_bytes > 0 && static_cast<int64_t>(n_bytes) <= fast.max_bytes;
+  }
+
+  // 2-rank all reduce as one full duplex exchange: each rank sends its whole
+  // vector at once (a 4 KiB work request, then 64 KiB ones) and reduces each
+  // chunk when its receive completes. The receive lengths equal the send
+  // lengths, because the provider does not complete a shorter send.
+  // The reduction order is the stock one: rank 0's value first.
+  template <typename T, typename ReduceOp>
+  void
+  exchange_all_reduce(const T* in, T* out, int64_t size, ReduceOp reduce_op) {
+    auto& fast = FastAllSumConfig::get();
+    int peer = 1 - rank_;
+    Connection& conn = connections_[peer];
+    SharedBuffer& sbuf = exchange_buffers_[0];
+    SharedBuffer& rbuf = exchange_buffers_[1];
+    char* sdata = sbuf.data<char>();
+    char* rdata = rbuf.data<char>();
+    uint32_t slkey = sbuf.local_key(conn.protection_domain);
+    uint32_t rlkey = rbuf.local_key(conn.protection_domain);
+    int64_t n_bytes = size * static_cast<int64_t>(sizeof(T));
+
+    int64_t offsets[FastAllSumConfig::MAX_CHUNKS + 1];
+    int n_chunks = 0;
+    offsets[0] = 0;
+    for (int64_t off = 0; off < n_bytes; n_chunks++) {
+      int64_t lim = n_chunks == 0 ? fast.chunk0 : fast.chunk;
+      int64_t len = std::min(n_bytes - off, lim);
+      off += len;
+      offsets[n_chunks + 1] = off;
+    }
+
+    // Receives first, chained in one post.
+    ibv_recv_wr rwr[FastAllSumConfig::MAX_CHUNKS];
+    ibv_sge rsge[FastAllSumConfig::MAX_CHUNKS];
+    for (int c = 0; c < n_chunks; c++) {
+      rsge[c].addr = reinterpret_cast<uintptr_t>(rdata + offsets[c]);
+      rsge[c].length = static_cast<uint32_t>(offsets[c + 1] - offsets[c]);
+      rsge[c].lkey = rlkey;
+      rwr[c].wr_id = static_cast<uint64_t>(EXCHANGE_RECV_WR) << 16 | c;
+      rwr[c].sg_list = &rsge[c];
+      rwr[c].num_sge = 1;
+      rwr[c].next = c + 1 < n_chunks ? &rwr[c + 1] : nullptr;
+    }
+    ibv_recv_wr* bad_recv;
+    if (ibv_post_recv(conn.queue_pair, &rwr[0], &bad_recv) != 0) {
+      throw std::runtime_error("[jaccl] exchange post_recv failed");
+    }
+
+    // Copy each chunk into the registered send region and post it at once.
+    // All copies finish before any reduction writes out, so in == out is safe.
+    const char* src = reinterpret_cast<const char*>(in);
+    for (int c = 0; c < n_chunks; c++) {
+      int64_t len = offsets[c + 1] - offsets[c];
+      std::memcpy(sdata + offsets[c], src + offsets[c], len);
+      ibv_sge sge;
+      sge.addr = reinterpret_cast<uintptr_t>(sdata + offsets[c]);
+      sge.length = static_cast<uint32_t>(len);
+      sge.lkey = slkey;
+      ibv_send_wr wr, *bad_send;
+      std::memset(&wr, 0, sizeof(wr));
+      wr.wr_id = static_cast<uint64_t>(EXCHANGE_SEND_WR) << 16 | c;
+      wr.sg_list = &sge;
+      wr.num_sge = 1;
+      wr.opcode = IBV_WR_SEND;
+      // Only the last send is signaled; its completion retires the others.
+      wr.send_flags = c + 1 == n_chunks ? IBV_SEND_SIGNALED : 0;
+      if (ibv_post_send(conn.queue_pair, &wr, &bad_send) != 0) {
+        throw std::runtime_error("[jaccl] exchange post_send failed");
+      }
+    }
+
+    // Reduce chunks as their receives complete. The sources are the staged
+    // own copy and the receive region, so out may alias in.
+    const T* own = reinterpret_cast<const T*>(sdata);
+    const T* other = reinterpret_cast<const T*>(rdata);
+    const T* first = rank_ == 0 ? own : other;
+    const T* second = rank_ == 0 ? other : own;
+    int pending = n_chunks + 1;
+    while (pending > 0) {
+      ibv_wc wc[2 * FastAllSumConfig::MAX_CHUNKS];
+      int n = conn.poll(2 * FastAllSumConfig::MAX_CHUNKS, wc);
+      for (int i = 0; i < n; i++) {
+        if (wc[i].status != IBV_WC_SUCCESS) {
+          throw std::runtime_error(
+              "[jaccl] exchange completion error " +
+              std::to_string(wc[i].status));
+        }
+        int work_type = wc[i].wr_id >> 16;
+        int c = wc[i].wr_id & 0xffff;
+        pending--;
+        if (work_type == EXCHANGE_RECV_WR) {
+          int64_t e0 = offsets[c] / static_cast<int64_t>(sizeof(T));
+          int64_t e1 = offsets[c + 1] / static_cast<int64_t>(sizeof(T));
+          reduce_op(first + e0, second + e0, out + e0, e1 - e0);
+        }
+      }
+    }
+  }
 
   template <typename T, typename ReduceOp>
   void all_reduce(const T* in, T* out, int64_t size, ReduceOp reduce_op) {
@@ -626,6 +737,7 @@ class MeshImpl {
   std::span<Connection> connections_;
   std::span<SharedBuffer> buffers_;
   std::span<SharedBuffer> scatter_buffers_;
+  std::span<SharedBuffer> exchange_buffers_;
   std::unique_ptr<char[]> staging_mem_;
 };
 

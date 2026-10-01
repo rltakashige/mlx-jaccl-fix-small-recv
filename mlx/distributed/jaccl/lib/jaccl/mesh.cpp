@@ -1,6 +1,7 @@
 // Copyright © 2026 Apple Inc.
 
 #include "jaccl/mesh.h"
+#include "jaccl/fast_allsum.h"
 #include "jaccl/reduction_ops.h"
 #include "jaccl/types.h"
 
@@ -28,7 +29,13 @@ MeshGroup::MeshGroup(
   side_channel_.barrier();
 
   // Create the mesh implementation object
-  mesh_ = MeshImpl(rank_, size_, connections_, buffers_, scatter_buffers_);
+  mesh_ = MeshImpl(
+      rank_,
+      size_,
+      connections_,
+      buffers_,
+      scatter_buffers_,
+      exchange_buffers_);
 }
 
 void MeshGroup::initialize() {
@@ -127,6 +134,16 @@ void MeshGroup::allocate_buffers() {
       }
     }
   }
+  exchange_buffers_.clear();
+  auto& fast = FastAllSumConfig::get();
+  if (fast.enabled && size_ == 2) {
+    auto& peer = connections_[1 - rank_];
+    for (int i = 0; i < 2; i++) {
+      exchange_buffers_.emplace_back(fast.max_bytes);
+      exchange_buffers_.back().register_to_protection_domain(
+          peer.protection_domain);
+    }
+  }
 }
 
 void MeshGroup::all_sum(
@@ -200,6 +217,10 @@ void MeshGroup::all_reduce(
   auto in_ptr = static_cast<const T*>(input);
   auto out_ptr = static_cast<T*>(output);
   int64_t count = n_bytes / sizeof(T);
+  if (mesh_.can_exchange(n_bytes)) {
+    mesh_.exchange_all_reduce(in_ptr, out_ptr, count, reduce_op);
+    return;
+  }
   if (size_ > 2 && n_bytes > 32 * 1024) {
     // Large messages are bandwidth bound so use the reduce scatter + all gather
     // path which moves size_x less data per link than the fully connected

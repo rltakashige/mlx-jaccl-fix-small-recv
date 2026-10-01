@@ -16,6 +16,8 @@
 constexpr const char* IBV_TAG = "[jaccl]";
 constexpr int SEND_WR = 1;
 constexpr int RECV_WR = 2;
+constexpr int EXCHANGE_SEND_WR = 3;
+constexpr int EXCHANGE_RECV_WR = 4;
 constexpr int MAX_SEND_WR = 32;
 constexpr int MAX_RECV_WR = 32;
 constexpr int BUFFER_SIZES = 8;
