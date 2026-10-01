@@ -3,6 +3,7 @@
 #pragma once
 
 #include <functional>
+#include <optional>
 #include <string>
 
 #include "mlx/distributed/distributed.h"
@@ -22,6 +23,8 @@ struct GpuAllSumChannel {
   size_t recv_offset[2]{0, 0};
   std::function<void(uint32_t, size_t)> post;
   std::function<std::string()> error;
+  // All GPU all_sums use one stream, so seq order is the GPU execution order.
+  std::optional<Stream> stream;
   // Set by the GPU backend.
   uint32_t next_seq{0};
   void* gpu_buffer{nullptr};

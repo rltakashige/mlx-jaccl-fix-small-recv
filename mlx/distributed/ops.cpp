@@ -38,14 +38,17 @@ array all_reduce(
         x.dtype() == bfloat16 || x.dtype() == float16 || x.dtype() == float32;
     if (ch != nullptr && type_ok && x.nbytes() > 0 &&
         x.nbytes() <= ch->slot_bytes) {
-      auto st = to_stream(s);
-      if (x.has_primitive() && x.primitive().stream().device == Device::gpu) {
-        stream = x.primitive().stream();
-      } else if (st.device == Device::gpu) {
-        stream = st;
-      } else {
-        stream = default_stream(Device::gpu);
+      if (!ch->stream) {
+        auto st = to_stream(s);
+        if (x.has_primitive() && x.primitive().stream().device == Device::gpu) {
+          ch->stream = x.primitive().stream();
+        } else if (st.device == Device::gpu) {
+          ch->stream = st;
+        } else {
+          ch->stream = default_stream(Device::gpu);
+        }
       }
+      stream = *ch->stream;
     }
   }
   return array(

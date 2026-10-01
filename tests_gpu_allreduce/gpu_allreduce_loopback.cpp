@@ -157,6 +157,39 @@ int main(int argc, char** argv) {
     ok &= run_case({3, 7}, dt, 16, 5, false);
   }
   ok &= run_case({1, 5121}, bfloat16, 64, 5, false); // odd byte count / 4
+
+  // Producers on two GPU streams: every all_sum must still run on one stream.
+  {
+    dist::Group g(std::make_shared<LoopGroup>(64 * 1024, 0));
+    auto s2 = new_stream(Device::gpu);
+    auto v = astype(
+        random::normal({1, 5120}, float32, 0.0, 1.0, random::key(9)), bfloat16);
+    eval(v);
+    std::vector<array> xs, ys;
+    array prev = zeros({1, 5120}, bfloat16);
+    bool same = true;
+    for (int j = 0; j < 64; j++) {
+      auto x = multiply(
+          v, array(0.5f, bfloat16), j % 2 ? s2 : default_stream(Device::gpu));
+      auto y = dist::all_sum(x, g);
+      same &=
+          ys.empty() || y.primitive().stream() == ys[0].primitive().stream();
+      xs.push_back(x);
+      ys.push_back(y);
+      v = y;
+    }
+    eval(ys);
+    bool bits = same;
+    for (int j = 0; bits && j < 64; j++) {
+      auto ref = add(xs[j], j == 0 ? prev : xs[j - 1], Device::cpu);
+      eval(ref);
+      bits = same_bits(ys[j], ref);
+    }
+    std::cout << (bits ? "PASS" : "FAIL")
+              << " two producer streams, one all_sum stream=" << same
+              << std::endl;
+    ok &= bits;
+  }
   std::cout << (ok ? "ALL PASS" : "SOME FAIL") << std::endl;
   return ok ? 0 : 1;
 }
