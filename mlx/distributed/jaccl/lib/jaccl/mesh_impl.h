@@ -74,12 +74,20 @@ class MeshImpl {
       offsets[n_chunks + 1] = off;
     }
 
+    auto wire_len = [&](int c) -> uint32_t {
+      int64_t len = offsets[c + 1] - offsets[c];
+      if (fast.pad) {
+        len = (len + 4095) / 4096 * 4096;
+      }
+      return static_cast<uint32_t>(len);
+    };
+
     // Receives first, chained in one post.
     ibv_recv_wr rwr[FastAllSumConfig::MAX_CHUNKS];
     ibv_sge rsge[FastAllSumConfig::MAX_CHUNKS];
     for (int c = 0; c < n_chunks; c++) {
       rsge[c].addr = reinterpret_cast<uintptr_t>(rdata + offsets[c]);
-      rsge[c].length = static_cast<uint32_t>(offsets[c + 1] - offsets[c]);
+      rsge[c].length = wire_len(c);
       rsge[c].lkey = rlkey;
       rwr[c].wr_id = static_cast<uint64_t>(EXCHANGE_RECV_WR) << 16 | c;
       rwr[c].sg_list = &rsge[c];
@@ -99,7 +107,7 @@ class MeshImpl {
       std::memcpy(sdata + offsets[c], src + offsets[c], len);
       ibv_sge sge;
       sge.addr = reinterpret_cast<uintptr_t>(sdata + offsets[c]);
-      sge.length = static_cast<uint32_t>(len);
+      sge.length = wire_len(c);
       sge.lkey = slkey;
       ibv_send_wr wr, *bad_send;
       std::memset(&wr, 0, sizeof(wr));

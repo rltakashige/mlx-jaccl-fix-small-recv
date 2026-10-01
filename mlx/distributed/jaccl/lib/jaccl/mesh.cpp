@@ -139,7 +139,7 @@ void MeshGroup::allocate_buffers() {
   if (fast.enabled && size_ == 2) {
     auto& peer = connections_[1 - rank_];
     for (int i = 0; i < 2; i++) {
-      exchange_buffers_.emplace_back(fast.max_bytes);
+      exchange_buffers_.emplace_back(fast.max_bytes + 4096);
       exchange_buffers_.back().register_to_protection_domain(
           peer.protection_domain);
     }

@@ -13,6 +13,9 @@ struct FastAllSumConfig {
   int64_t chunk0 = 4096; // first work request, so the wire starts at once
   int64_t chunk = 65536; // later work requests
   int64_t max_bytes = 0; // larger messages use the stock path
+  // Round each work request up to whole 4 KiB packets (MLX_JACCL_FAST_PAD=0
+  // sends the exact length). Stock JACCL only sends 4 KiB multiples.
+  bool pad = true;
 
   static constexpr int MAX_CHUNKS = 16; // fits MAX_SEND_WR and MAX_RECV_WR
 
@@ -21,6 +24,9 @@ struct FastAllSumConfig {
       FastAllSumConfig c;
       const char* on = std::getenv("MLX_JACCL_FAST_ALLSUM");
       c.enabled = on != nullptr && on[0] == '1';
+      if (const char* v = std::getenv("MLX_JACCL_FAST_PAD")) {
+        c.pad = v[0] != '0';
+      }
       if (const char* v = std::getenv("MLX_JACCL_FAST_CHUNK0")) {
         c.chunk0 = std::strtoll(v, nullptr, 10);
       }
